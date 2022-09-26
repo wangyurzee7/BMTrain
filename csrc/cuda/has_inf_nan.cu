@@ -4,12 +4,7 @@
 
 namespace{
 __inline__ __device__ bool isnan_(half v) {
-#if __CUDA_ARCH__ >= 700 || __CUDA_ARCH__ == 600
-    return __hisnan(v);
-#else
-    
-    return !__heq(v, v);
-#endif
+    return ::isnan(__half2float(v));
 }
 
 __inline__ __device__ int8_t warpReduceAny(int8_t x) {
