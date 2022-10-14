@@ -13,7 +13,10 @@ def check_overflow(param_groups):
     for group in param_groups:
         for p in group['params']:
             if p.grad is not None and p.dtype == torch.half: # TODO support other types
-                G.f_has_inf_nan(p.grad, has_inf_or_nan)
+                if p.grad.is_cuda:
+                    G.f_has_inf_nan(p.grad, has_inf_or_nan)
+                else: # TODO: C.f_has_inf_nan
+                    has_inf_or_nan += torch.isnan(p.grad).sum() + torch.isinf(p.grad).sum()
 
     if "comm" in config:
         nccl.allReduce(has_inf_or_nan.storage(), has_inf_or_nan.storage(), "max", config["comm"])
@@ -184,10 +187,16 @@ class OptimManager:
         # total_norm = total_norm / scale
         # clip_coef = float(max_norm) / (total_norm + eps)
         clip_coef = float(max_norm * scale) / (total_norm + eps)
+        clip_coef_cpu = None
         if clip_coef < 1:
             for p in parameters:
                 if p.grad is not None:
-                    p.grad.data.mul_(clip_coef)
+                    if p.grad.is_cuda:
+                        p.grad.data.mul_(clip_coef)
+                    else:
+                        if clip_coef_cpu is None: # TODO: better implementation?
+                            clip_coef_cpu = clip_coef.cpu() # TODO: error caused here!
+                        p.grad.data.mul_(clip_coef_cpu)
         return total_norm / scale
 
     @torch.no_grad()

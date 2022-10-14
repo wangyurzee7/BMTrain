@@ -72,16 +72,23 @@ class AdamOffloadOptimizer(torch.optim.Optimizer):
                             state['_param_fp32'] = torch.empty(p.size(), dtype=torch.float32, device="cpu")     # on host
                             state['_param_fp32'].copy_(p)
 
-                            # placeholder
-                            state["_param_fp16"] = torch.empty(p.size(), dtype=torch.float16, pin_memory=True)  # on host
-                            state["_grad_fp16"] = torch.empty(p.size(), dtype=torch.float16, pin_memory=True)   # on host
+                            if p.is_cuda:
+                                # placeholder
+                                state["_param_fp16"] = torch.empty(p.size(), dtype=torch.float16, pin_memory=True)  # on host
+                                state["_grad_fp16"] = torch.empty(p.size(), dtype=torch.float16, pin_memory=True)   # on host
+                            else:
+                                state["_param_fp16"] = torch.tensor([], dtype=torch.float16, device="cpu").set_(p.data)  # on host
+                                state["_grad_fp16"] = torch.tensor([], dtype=torch.float16, device="cpu").set_(p.grad)  # on host
                         else:
-                            state['_param_fp32'] = torch.empty(p.size(), dtype=torch.float32, pin_memory=True)     # on host
-                            state['_param_fp32'].copy_(p)
-
-                            # placeholder
-                            state["_grad_fp32"] = torch.empty(p.size(), dtype=torch.float32, pin_memory=True)   # on host
-
+                            if p.is_cuda:
+                                state['_param_fp32'] = torch.empty(p.size(), dtype=torch.float32, pin_memory=True)     # on host
+                                state['_param_fp32'].copy_(p)
+                                # placeholder
+                                state["_grad_fp32"] = torch.empty(p.size(), dtype=torch.float32, pin_memory=True)   # on host
+                            else:
+                                state["_param_fp32"] = torch.tensor([], dtype=torch.float32, device="cpu").set_(p.data)  # on host
+                                state["_grad_fp32"] = torch.tensor([], dtype=torch.float32, device="cpu").set_(p.grad)  # on host
+                                
                     if p not in self._events:
                         self._events[p] = torch.cuda.Event()
 
@@ -89,6 +96,8 @@ class AdamOffloadOptimizer(torch.optim.Optimizer):
 
         # transfer parameters to host asynchronously
         for param, state, event, _, _, _, _, _ in update_params:
+            if not param.is_cuda:
+                continue
             if param.dtype == torch.half:
                 state["_grad_fp16"].copy_(param.grad, non_blocking=True)
             else:
@@ -120,7 +129,8 @@ class AdamOffloadOptimizer(torch.optim.Optimizer):
                     state["step"]
                 )
                 # transfer parameters back to device asynchronously
-                param.copy_(state["_param_fp16"], non_blocking=True)
+                if param.is_cuda:
+                    param.copy_(state["_param_fp16"], non_blocking=True)
             else:
                 state["_grad_fp32"].mul_(1.0 / scale)
                 if ('maximize' in group) and (group['maximize'] is True):
@@ -146,7 +156,8 @@ class AdamOffloadOptimizer(torch.optim.Optimizer):
                     **other_kwargs
                 )
                 # transfer parameters back to device asynchronously
-                param.copy_(state["_param_fp32"], non_blocking=True)
+                if param.is_cuda:
+                    param.copy_(state["_param_fp32"], non_blocking=True)
 
         return loss
 

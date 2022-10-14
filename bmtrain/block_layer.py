@@ -9,6 +9,7 @@ from .parameter import DistributedParameter, OpAllGather
 from .checkpointing import ScopedTensorInspectorContext
 from . import debug
 import copy
+import warnings
 
 
 # the flag is used to control the zero level , 0 means normal zero3 , 1 means forward without release parameter ,2 means backward without gather parameter
@@ -143,6 +144,8 @@ class CheckpointBlockContext:
         wait_loader()
         requires_grad = torch.is_grad_enabled()
         with torch.cuda.stream(config["load_stream"]):
+            if self.block._offload:
+                self.block._prefetch_params()
             for kw, val in self.block._storage_info.items():
                 assert self.block._storage_params[kw].is_cuda
                 assert kw not in self._grad_buffer
@@ -260,6 +263,9 @@ class CheckpointBlockContext:
         if self.flag == 1:
             for i in self._param_buffer:
                 self.ctx_dict[i] = self._param_buffer[i]
+        if self.block._offload:
+            self.block._offload_grads()
+
         self._grad_tensor = {}
         self._param_tensor = {}
         self._grad_buffer = {}
@@ -268,8 +274,10 @@ class CheckpointBlockContext:
         # reduce scatter gradients
         self.exit()
 
-def storage_type_cuda(storage_type):
-    STORAGE_MAP = {
+def _storage_type(storage_type, to):
+    to = to.lower().strip()
+    assert to in ["cpu", "cuda"]
+    STORAGE_MAP_CPU_TO_CUDA = {
         torch.FloatStorage: torch.cuda.FloatStorage,
         torch.DoubleStorage: torch.cuda.DoubleStorage,
         torch.HalfStorage: torch.cuda.HalfStorage,
@@ -278,18 +286,31 @@ def storage_type_cuda(storage_type):
         torch.ByteStorage: torch.cuda.ByteStorage,
         torch.ShortStorage: torch.cuda.ShortStorage,
         torch.IntStorage: torch.cuda.IntStorage,
-        torch.cuda.FloatStorage: torch.cuda.FloatStorage,
-        torch.cuda.DoubleStorage: torch.cuda.DoubleStorage,
-        torch.cuda.HalfStorage: torch.cuda.HalfStorage,
-        torch.cuda.BFloat16Storage: torch.cuda.BFloat16Storage,
-        torch.cuda.CharStorage: torch.cuda.CharStorage,
-        torch.cuda.ByteStorage: torch.cuda.ByteStorage,
-        torch.cuda.ShortStorage: torch.cuda.ShortStorage,
-        torch.cuda.IntStorage: torch.cuda.IntStorage,
     }
-    if storage_type not in STORAGE_MAP:
+    STORAGE_MAP_CUDA_TO_CPU = {
+        torch.cuda.FloatStorage: torch.FloatStorage,
+        torch.cuda.DoubleStorage: torch.DoubleStorage,
+        torch.cuda.HalfStorage: torch.HalfStorage,
+        torch.cuda.BFloat16Storage: torch.BFloat16Storage,
+        torch.cuda.CharStorage: torch.CharStorage,
+        torch.cuda.ByteStorage: torch.ByteStorage,
+        torch.cuda.ShortStorage: torch.ShortStorage,
+        torch.cuda.IntStorage: torch.IntStorage,
+    }
+    if (storage_type not in STORAGE_MAP_CPU_TO_CUDA) and (storage_type not in STORAGE_MAP_CUDA_TO_CPU):
         raise ValueError("Unknown storage type: {}".format(storage_type))
-    return STORAGE_MAP[storage_type]
+    if (to == "cuda") and (storage_type in STORAGE_MAP_CPU_TO_CUDA):
+        return STORAGE_MAP_CPU_TO_CUDA[storage_type]
+    if (to == "cpu") and (storage_type in STORAGE_MAP_CUDA_TO_CPU):
+        return STORAGE_MAP_CUDA_TO_CPU[storage_type]
+    return storage_type
+
+def storage_type_cuda(storage_type):
+    return _storage_type(storage_type, to = "cuda")
+
+def storage_type_cpu(storage_type):
+    return _storage_type(storage_type, to = "cpu")
+
 
 def _get_param_kw(param : DistributedParameter):
     type_name = str(param.dtype).split(".")[-1]
@@ -298,6 +319,7 @@ def _get_param_kw(param : DistributedParameter):
     if param.group is not None:
         group_name = "_g_" + param.group
     return type_name + grad_name + group_name
+
 
 class CheckpointBlock(torch.nn.Module):
     """ Checkpoint a model or part of the model.
@@ -316,7 +338,7 @@ class CheckpointBlock(torch.nn.Module):
         >>> y2, ... = transformer_block(x)
         >>> assert torch.allclose(y1, y2)
     """
-    def __init__(self, inner_module : torch.nn.Module):
+    def __init__(self, inner_module : torch.nn.Module, offload = False):
         super().__init__()
         self._module = inner_module
         # build large parameter&grad here
@@ -324,6 +346,9 @@ class CheckpointBlock(torch.nn.Module):
         self._storage_params : Dict[str, torch.nn.Parameter] = {}
         self._storage_info = {}
         self._ready = False
+        self._offload = offload
+        if offload:
+            self._on_gpu = False
         # sort parameters by name
         ordered_parameters = list(self._module.named_parameters())
 
@@ -332,7 +357,10 @@ class CheckpointBlock(torch.nn.Module):
             if not isinstance(param, DistributedParameter):
                 raise ValueError("All parameters in checkpoint block must be DistributedParameter.")
 
-            storage_type = storage_type_cuda(param.storage_type())
+            if offload:
+                storage_type = storage_type_cpu(param.storage_type())
+            else:
+                storage_type = storage_type_cuda(param.storage_type())
             kw_name = _get_param_kw(param)
 
             if kw_name not in self._storage_info:
@@ -365,20 +393,23 @@ class CheckpointBlock(torch.nn.Module):
             storage_type = val["storage_type"]
 
             storage_param_buffer = storage_type(partition_size)
+            if offload:
+                storage_param_buffer = storage_param_buffer.pin_memory()
 
             dtype = storage_param_buffer.dtype
             device = storage_param_buffer.device
 
             # bind storage to buffer tensor
-            storage_param = torch.nn.Parameter(
-                torch.tensor([], dtype=dtype, device=device).set_(storage_param_buffer)
-            )
+            storage_tensor = torch.tensor([], dtype=dtype, device=device).set_(storage_param_buffer)
+            storage_param = torch.nn.Parameter(storage_tensor)
             if val["requires_grad"]:
                 storage_param.requires_grad_(True)
+                if offload:
+                    storage_param.grad = torch.empty(storage_param.size(), dtype=storage_param.dtype, pin_memory=True).zero_()
             else:
                 storage_param.requires_grad_(False)
+            
 
-        
             self._storage_params[kw] = storage_param
 
         # initialize parameters in module
@@ -420,13 +451,24 @@ class CheckpointBlock(torch.nn.Module):
                 
                 # copy to buffer
                 # PyTorch 1.11 changed the API of storage.__getitem__
-                d_dtype = self._storage_params[kw_name].dtype
-                d_device = self._storage_params[kw_name].device
-                param.data = torch.tensor([], dtype=param.dtype, device=param.device).set_(self._storage_params[kw_name].storage(), to_offset_st, (to_offset_end - to_offset_st,))
                 self._param_info[-1]["begin"] = to_offset_st
                 self._param_info[-1]["end"] = (to_offset_end - to_offset_st,)
+                d_dtype = self._storage_params[kw_name].dtype
+                d_device = self._storage_params[kw_name].device
+                if offload:
+                    param.data = torch.tensor([], dtype=param.dtype, device=param.device)
+                    _param_gpu = param
+                    param = param.to(d_device).detach()
+                    contiguous_param = contiguous_param.to(d_device)
+                param.data = torch.tensor([], dtype=param.dtype, device=param.device).set_(self._storage_params[kw_name].storage(), to_offset_st, (to_offset_end - to_offset_st,))
                 param.data[:] = \
                     torch.tensor([], dtype=d_dtype, device=d_device).set_(contiguous_param.storage(), offset_st, (offset_end - offset_st,))[:]
+                if offload:
+                    if _param_gpu.requires_grad:
+                        param.requires_grad_(True)
+                        param.grad = torch.tensor([], dtype=param.dtype).set_(self._storage_params[kw_name].grad.storage(), to_offset_st, (to_offset_end - to_offset_st,))
+                    self._param_info[-1]["parameter_cpu"] = param
+                    param = _param_gpu
                 del contiguous_param
             else:
                 param.data = torch.tensor([], dtype=param.dtype, device=param.device)
@@ -436,7 +478,92 @@ class CheckpointBlock(torch.nn.Module):
 
         for kw in offsets.keys():
             assert offsets[kw] == self._storage_info[kw]["total"]
+
     
+    def _prefetch_params(self, param_storage_buffer = None, grad_storage_buffer = None):
+        assert self._offload
+        assert not self._on_gpu
+        self._on_gpu = True
+        self._storage_params_cpu = {}
+        if param_storage_buffer is None:
+            param_storage_buffer = {}
+        if grad_storage_buffer is None:
+            grad_storage_buffer = {}
+        for kw, val in self._storage_info.items():
+            val["storage_type"] = storage_type_cuda(val["storage_type"])
+            storage_type = val["storage_type"]
+
+            partition_size = val["partition_size"]
+            if kw not in param_storage_buffer:
+                param_storage_buffer[kw] = storage_type(partition_size)
+            curr_param_storage_buffer = param_storage_buffer[kw]
+
+            if val["requires_grad"]:
+                if kw not in grad_storage_buffer:
+                    grad_storage_buffer[kw] = storage_type(partition_size)
+                curr_grad_storage_buffer = grad_storage_buffer[kw]
+            
+            assert curr_param_storage_buffer.size() == partition_size
+            if curr_param_storage_buffer.size() != partition_size:
+                warnings.warn("Size of storage buffer for prefetching does not match. This warning is maybe caused by different sizes between transformer layers.")
+                if partition_size > curr_storage_buffer.size():
+                    curr_param_storage_buffer.resize_(partition_size)
+                    if val["requires_grad"]:
+                        curr_grad_storage_buffer.resize_(partition_size)
+            
+            curr_param_storage_buffer.copy_(self._storage_params[kw].storage(), non_blocking = True)
+
+            dtype = curr_param_storage_buffer.dtype
+            device = curr_param_storage_buffer.device
+
+            # bind storage to buffer tensor
+            storage_param = torch.nn.Parameter(
+                torch.tensor([], dtype=dtype, device=device).set_(curr_param_storage_buffer)
+            )
+            if val["requires_grad"]:
+                storage_param.requires_grad_(True)
+                storage_param.grad = torch.tensor([], dtype=dtype, device=device).set_(curr_grad_storage_buffer).zero_()
+            else:
+                storage_param.requires_grad_(False)
+
+            self._storage_params_cpu[kw], self._storage_params[kw] = self._storage_params[kw], storage_param
+        self._storage_buffer_gpu = param_storage_buffer, grad_storage_buffer
+        return self._storage_buffer_gpu
+
+    def _offload_grads(self, release_gpu_storage = True):
+        assert self._offload
+        assert self._on_gpu
+        self._on_gpu = False
+        requires_grad = torch.is_grad_enabled()
+        with torch.cuda.stream(config["load_stream"]):
+            for kw, val in self._storage_info.items():
+                if requires_grad and val["requires_grad"]:
+                    grad_on_cpu = self._storage_params_cpu[kw].grad
+                    assert grad_on_cpu is not None
+                    _g = self._storage_params[kw].grad.cpu()
+                    grad_on_cpu += _g
+
+        for kw, val in self._storage_info.items():
+            if requires_grad and val["requires_grad"]:
+                self._storage_params[kw].grad.record_stream(config["load_stream"])
+                if release_gpu_storage:
+                    grad_on_gpu, self._storage_params[kw].grad = self._storage_params[kw].grad, None
+                else:
+                    self._storage_params[kw].grad.zero_()
+            if release_gpu_storage:
+                param_on_gpu, self._storage_params[kw] = self._storage_params[kw], self._storage_params_cpu[kw]
+            else:
+                self._storage_params[kw] = self._storage_params_cpu[kw]
+            val["storage_type"] = storage_type_cpu(val["storage_type"])
+
+        for param in self._param_info:
+            dtype = param["parameter"].dtype
+            device = param["parameter"].device
+            param["parameter"].data = torch.tensor([], dtype=dtype, device=device)
+            param["parameter"].grad = torch.tensor([], dtype=dtype, device=device)
+        if release_gpu_storage:
+            self._storage_buffer_gpu = {}, {}
+
     def __call__(self, *args, **kwargs):
         # gather here
         placeholder = torch.tensor([], requires_grad=torch.is_grad_enabled())
@@ -507,6 +634,8 @@ class CheckpointBlock(torch.nn.Module):
                 # PyTorch 1.11 changed the API of storage.__getitem__
                 d_dtype = self._storage_params[kw_name].dtype
                 d_device = self._storage_params[kw_name].device
+                if self._offload:
+                    contiguous_param = contiguous_param.to(d_device)
                 torch.tensor([], dtype=d_dtype, device=d_device).set_(self._storage_params[kw_name].storage(), to_offset_st, (to_offset_end - to_offset_st,))[:] = \
                     torch.tensor([], dtype=d_dtype, device=d_device).set_(contiguous_param.storage(), offset_st, (offset_end - offset_st,))[:]
                 del contiguous_param
@@ -527,6 +656,14 @@ class CheckpointBlock(torch.nn.Module):
             ret[val["group"]].append(self._storage_params[kw])
         for kw, val in ret.items():
             yield kw, val
+
+    def named_parameters(self, prefix: str = '', recurse: bool = True):
+        if self._offload:
+            assert not self._on_gpu
+            for param in self._param_info:
+                if "parameter_cpu" in param:
+                    if param["parameter_cpu"].numel() > 0:
+                        yield param["name"], param["parameter_cpu"]
 
     def init_parameters(self):
         """
@@ -631,6 +768,7 @@ class CheckpointBlock(torch.nn.Module):
 class OpTransformerBlockList(torch.autograd.Function):
     @staticmethod
     def forward(ctx, placeholder, self : 'TransformerBlockList', save_list, hidden_state, *args):
+        offload_list = [save_list[i][2] for i in range(len(save_list))] # Let save_list[i][2] denotes whether offload checkpoint #i.
         tensors = []
         others = []
         for arg in args:
@@ -644,15 +782,33 @@ class OpTransformerBlockList(torch.autograd.Function):
         ctx.nontensor_inputs = others
         ctx.self = self
         ctx.save_list = copy.deepcopy(save_list)
+        ctx.offload_list = copy.deepcopy(offload_list)
         ctx.num_save_needed = save_list[-1][1]+1
         ctx.layers_dict=[{} for _ in range(len(self))]
+        ctx.hidden_size = hidden_state.size()
+        ctx.offloading_checkpoint = False
+        ctx.offloading_parameter = False
         layer_inputs = []
         layer_inspector = []
         cuda_rng_state = []
+
+        offload_hidden_state = []
+        for i in range(len(self)):
+            if offload_list[i]:
+                ctx.offloading_checkpoint = True
+                offload_hidden_state.append(torch.empty(hidden_state.size(), dtype=hidden_state.dtype, device="cpu", pin_memory=True))
+            else:
+                offload_hidden_state.append(None)
+            if self[i]._offload:
+                ctx.offloading_parameter = True
         with torch.no_grad():
             for i in range(len(self)):
                 if save_list[i][0] == i:
-                    layer_inputs.append(hidden_state.detach())
+                    if offload_list[i]:
+                        offload_hidden_state[i].copy_(hidden_state, non_blocking=True)
+                        layer_inputs.append(offload_hidden_state[i])
+                    else:
+                        layer_inputs.append(hidden_state.detach())
                 cuda_rng_state.append( torch.cuda.get_rng_state() )
                 if config['zero_level']==2:
                     flag = 1
@@ -718,6 +874,14 @@ class OpTransformerBlockList(torch.autograd.Function):
                 nw_tensor.requires_grad = tensor.requires_grad
                 all_inputs.append(nw_tensor)
         
+        if ctx.offloading_checkpoint:
+            ipt_pf = torch.empty(ctx.hidden_size, dtype=grad_hidden_state.dtype, device=grad_hidden_state.device)
+            ipt_pf.requires_grad_(True)
+            # ipt = torch.empty(ctx.hidden_size, dtype=grad_hidden_state.dtype, device=grad_hidden_state.device)
+            # ipt = torch.tensor([], dtype=grad_hidden_state.dtype, device=grad_hidden_state.device)
+            # ipt.requires_grad_(True)
+            ipt = ipt_pf
+
         with torch.random.fork_rng(devices=[torch.cuda.current_device()], enabled=True):
             with torch.enable_grad():
                 # overlap load and scatter here
@@ -743,7 +907,12 @@ class OpTransformerBlockList(torch.autograd.Function):
                                 ctx.save_list[j+1][0] = j+1
                 
                     torch.cuda.set_rng_state(ctx.cuda_rng_state[i])
-                    ipt = layer_inputs[ctx.save_list[i][1]].requires_grad_()
+                    if ctx.offload_list[i]:
+                        ipt.data.copy_(layer_inputs[ctx.save_list[i][1]].data, non_blocking=True)
+                        ipt.grad = None
+                    else:
+                        ipt = layer_inputs[ctx.save_list[i][1]].requires_grad_(True)
+
                     if config['zero_level'] == 2:
                         flag = 2
                     else:
@@ -766,6 +935,7 @@ class OpTransformerBlockList(torch.autograd.Function):
                         # change the tensor in placeholder
                         ctx.layer_inspector[i][j]["requires_grad"] = it["requires_grad"]
                         ctx.layer_inspector[i][j]["tensor"] = it["tensor"]
+
                     torch.autograd.backward(
                         [output],
                         [grad_hidden_state]
@@ -773,8 +943,9 @@ class OpTransformerBlockList(torch.autograd.Function):
                     grad_hidden_state = ipt.grad
                     if grad_middle is not None:
                         grad_hidden_state = grad_hidden_state + grad_middle[i]
-                
+
                 exit_prev(prev_ctx, prev_grad)
+
 
         grads = []
         for inp, requires_grad in zip(all_inputs, input_requires_grad):
@@ -805,7 +976,7 @@ class TransformerBlockList(torch.nn.Module):
     """
     _modules: Dict[str, CheckpointBlock]
 
-    def __init__(self, modules: Iterable[CheckpointBlock], sqrt=False) -> None:
+    def __init__(self, modules: Iterable[CheckpointBlock], sqrt=False, offload_checkpoints = False) -> None:
         super().__init__()
         
         self._modules = {}
@@ -823,11 +994,11 @@ class TransformerBlockList(torch.nn.Module):
             for i in range(length-1, -1, -1):
                 if num_freed == 0 or i == 0:
                     num_save_needed += 1
-                    save_list[i] = [1, -num_save_needed]
+                    save_list[i] = [1, -num_save_needed, offload_checkpoints]
                     num_freed = num_save_needed
                 else:
                     num_freed -= 1
-                    save_list[i] = [0, -(num_save_needed - num_freed)]
+                    save_list[i] = [0, -(num_save_needed - num_freed), False]
             for i in range(length-1, -1, -1):
                 save_list[i][1] += num_save_needed
             for i in range(0, length):
@@ -835,7 +1006,7 @@ class TransformerBlockList(torch.nn.Module):
 
             self.save_list = save_list
         else:
-            self.save_list = [(i, i) for i in range(len(self))]
+            self.save_list = [(i, i, offload_checkpoints) for i in range(len(self))]
             
     def __len__(self) -> int:
         return len(self._modules)
