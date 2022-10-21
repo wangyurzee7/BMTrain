@@ -368,7 +368,8 @@ class CheckpointBlock(torch.nn.Module):
                     "total": 0,
                     "storage_type": storage_type,
                     "requires_grad": param.requires_grad,
-                    "group": param.group
+                    "group": param.group,
+                    "dtype": param.dtype,
                 }
 
             param_shape = param._original_shape
@@ -389,18 +390,16 @@ class CheckpointBlock(torch.nn.Module):
             val["end"] = (config['rank'] + 1) * partition_size
             offsets[kw] = 0
 
-
-            storage_type = val["storage_type"]
-
-            storage_param_buffer = storage_type(partition_size)
             if offload:
-                storage_param_buffer = storage_param_buffer.pin_memory()
-
-            dtype = storage_param_buffer.dtype
-            device = storage_param_buffer.device
-
-            # bind storage to buffer tensor
-            storage_tensor = torch.tensor([], dtype=dtype, device=device).set_(storage_param_buffer)
+                storage_tensor = torch.empty(partition_size, dtype=val["dtype"], pin_memory=True)
+                storage_param_buffer = storage_tensor.storage()
+            else:
+                storage_type = val["storage_type"]
+                storage_param_buffer = storage_type(partition_size)
+                dtype = storage_param_buffer.dtype
+                device = storage_param_buffer.device
+                # bind storage to buffer tensor
+                storage_tensor = torch.tensor([], dtype=dtype, device=device).set_(storage_param_buffer)
             storage_param = torch.nn.Parameter(storage_tensor)
             if val["requires_grad"]:
                 storage_param.requires_grad_(True)
@@ -941,6 +940,7 @@ class OpTransformerBlockList(torch.autograd.Function):
                         [grad_hidden_state]
                     )
                     grad_hidden_state = ipt.grad
+                    layer_inputs[ctx.save_list[i][1]].grad = None
                     if grad_middle is not None:
                         grad_hidden_state = grad_hidden_state + grad_middle[i]
 
@@ -986,6 +986,7 @@ class TransformerBlockList(torch.nn.Module):
             self._modules[str(i)] = module
             self.add_module(str(i), module)
 
+        # save_list[i] = (last_checkpoint, saving_index, whether_offloading)
         if sqrt:
             length = len(self)
             num_save_needed = 0
@@ -1018,7 +1019,11 @@ class TransformerBlockList(torch.nn.Module):
     def forward(self, hidden_state, *args, return_hidden_states = False):
         self.return_hidden_states = return_hidden_states
         placeholder = torch.tensor([], requires_grad=torch.is_grad_enabled())
-        last_hidden, middle_hiddens = OpTransformerBlockList.apply(placeholder, self, self.save_list, hidden_state, *args)
+        if torch.is_grad_enabled() and self.training:
+            save_list = self.save_list
+        else:
+            save_list = [(-1, 0, 0)] * len(self)
+        last_hidden, middle_hiddens = OpTransformerBlockList.apply(placeholder, self, save_list, hidden_state, *args)
         if return_hidden_states:
             return last_hidden, middle_hiddens
         else:
