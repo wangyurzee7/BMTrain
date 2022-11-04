@@ -53,8 +53,11 @@ class AdamOffloadOptimizer(torch.optim.Optimizer):
 
         for group in self.param_groups:
             for p in group['params']:
-                if p.grad is not None and p.requires_grad:
-                    if p.grad.is_sparse:
+                if p.requires_grad:
+                    grad = p.cpu_parameter.grad if p.on_host else p.grad
+                    if grad is None:
+                        continue
+                    if grad.is_sparse:
                         raise RuntimeError('Adam does not support sparse gradients, please consider SparseAdam instead')
                     if p.dtype not in [torch.float16, torch.float32]:
                         raise RuntimeError('Adam only supports fp32 or fp16 gradients')
@@ -62,6 +65,9 @@ class AdamOffloadOptimizer(torch.optim.Optimizer):
                     state = self.state[p]
                     # Lazy state initialization
                     if len(state) == 0:
+                        if not p.on_host:
+                            p.allocate_cpu_storage()
+                        _p, p = p, p.cpu_parameter
                         state['step'] = 0
                         # Exponential moving average of gradient values
                         state['exp_avg'] = torch.zeros(p.size(), dtype=torch.float32, device="cpu")         # on host
@@ -72,28 +78,18 @@ class AdamOffloadOptimizer(torch.optim.Optimizer):
                             state['_param_fp32'] = torch.empty(p.size(), dtype=torch.float32, device="cpu")     # on host
                             state['_param_fp32'].copy_(p)
 
-                            if p.is_cuda:
-                                # placeholder
-                                state["_param_fp16"] = torch.empty(p.size(), dtype=torch.float16, pin_memory=True)  # on host
-                                state["_grad_fp16"] = torch.empty(p.size(), dtype=torch.float16, pin_memory=True)   # on host
-                            else:
-                                state["_param_fp16"] = torch.tensor([], dtype=torch.float16, device="cpu").set_(p.data)  # on host
-                                state["_grad_fp16"] = torch.tensor([], dtype=torch.float16, device="cpu").set_(p.grad)  # on host
+                            state["_param_fp16"] = torch.tensor([], dtype=torch.float16, device="cpu").set_(p.data)  # on host
+                            state["_grad_fp16"] = torch.tensor([], dtype=torch.float16, device="cpu").set_(p.grad)  # on host
                         else:
-                            if p.is_cuda:
-                                state['_param_fp32'] = torch.empty(p.size(), dtype=torch.float32, pin_memory=True)     # on host
-                                state['_param_fp32'].copy_(p)
-                                # placeholder
-                                state["_grad_fp32"] = torch.empty(p.size(), dtype=torch.float32, pin_memory=True)   # on host
-                            else:
-                                state["_param_fp32"] = torch.tensor([], dtype=torch.float32, device="cpu").set_(p.data)  # on host
-                                state["_grad_fp32"] = torch.tensor([], dtype=torch.float32, device="cpu").set_(p.grad)  # on host
-                                
+                            state["_param_fp32"] = torch.tensor([], dtype=torch.float32, device="cpu").set_(p.data)  # on host
+                            state["_grad_fp32"] = torch.tensor([], dtype=torch.float32, device="cpu").set_(p.grad)  # on host
+                        p = _p
                     if p not in self._events:
                         self._events[p] = torch.cuda.Event()
 
                     update_params.append((p, state, self._events[p], group['betas'][0], group['betas'][1], group['eps'], group['lr'], group['weight_decay']))
 
+        '''
         # transfer parameters to host asynchronously
         for param, state, event, _, _, _, _, _ in update_params:
             if not param.is_cuda:
@@ -103,10 +99,11 @@ class AdamOffloadOptimizer(torch.optim.Optimizer):
             else:
                 state["_grad_fp32"].copy_(param.grad, non_blocking=True)
             torch.cuda.current_stream().record_event(event)
+        '''
 
         for param, state, event, beta1, beta2, eps, lr, weight_decay in update_params:
             # wait for transfer to host
-            event.synchronize()
+            # event.synchronize()
 
             state["step"] += 1
 
@@ -129,7 +126,7 @@ class AdamOffloadOptimizer(torch.optim.Optimizer):
                     state["step"]
                 )
                 # transfer parameters back to device asynchronously
-                if param.is_cuda:
+                if param.on_device:
                     param.copy_(state["_param_fp16"], non_blocking=True)
             else:
                 state["_grad_fp32"].mul_(1.0 / scale)
@@ -156,7 +153,7 @@ class AdamOffloadOptimizer(torch.optim.Optimizer):
                     **other_kwargs
                 )
                 # transfer parameters back to device asynchronously
-                if param.is_cuda:
+                if param.on_device:
                     param.copy_(state["_param_fp32"], non_blocking=True)
 
         return loss
@@ -263,3 +260,46 @@ class AdamOffloadOptimizer(torch.optim.Optimizer):
             'state': packed_state,
             'param_groups': param_groups,
         }
+
+    def zero_grad(self):
+        r"""Sets the gradients of all optimized :class:`torch.Tensor` s to zero.
+
+        Args:
+            set_to_none (bool): instead of setting to zero, set the grads to None.
+                This will in general have lower memory footprint, and can modestly improve performance.
+                However, it changes certain behaviors. For example:
+                1. When the user tries to access a gradient and perform manual ops on it,
+                a None attribute or a Tensor full of 0s will behave differently.
+                2. If the user requests ``zero_grad(set_to_none=True)`` followed by a backward pass, ``.grad``\ s
+                are guaranteed to be None for params that did not receive a gradient.
+                3. ``torch.optim`` optimizers have a different behavior if the gradient is 0 or None
+                (in one case it does the step with a gradient of 0 and in the other it skips
+                the step altogether).
+        """
+        foreach = self.defaults.get('foreach', False)
+
+        if not hasattr(self, "_zero_grad_profile_name"):
+            self._hook_for_profile()
+        if foreach:
+            per_device_and_dtype_grads = defaultdict(lambda: defaultdict(list))
+        with torch.autograd.profiler.record_function(self._zero_grad_profile_name):
+            for group in self.param_groups:
+                for _p in group['params']:
+                    if not _p.on_host:
+                        _p.allocate_cpu_storage()
+                    for p in [_p, _p.cpu_parameter]:
+                        if p.grad is not None:
+                            if p.grad.grad_fn is not None:
+                                p.grad.detach_()
+                            else:
+                                p.grad.requires_grad_(False)
+                            if (not foreach or p.grad.is_sparse):
+                                p.grad.zero_()
+                            else:
+                                per_device_and_dtype_grads[p.grad.device][p.grad.dtype].append(p.grad)
+            if foreach:
+                for _, per_dtype_grads in per_device_and_dtype_grads.items():
+                    for grads in per_dtype_grads.values():
+                        torch._foreach_zero_(grads)
+
+

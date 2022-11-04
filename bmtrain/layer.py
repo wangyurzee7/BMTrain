@@ -123,17 +123,3 @@ class DistributedModule(torch.nn.Module):
                     if input_name not in self._modules and input_name not in local_state:
                         unexpected_keys.append(key)
 
-    def parameters(self, recurse: bool = True):
-        for name, param in self.named_parameters(recurse=recurse):
-            if param.numel() > 0:
-                yield param
-
-    def named_parameters(self, prefix: str = '', recurse: bool = True):
-        # gen = super().named_parameters()
-        gen = self._named_members(
-            lambda module: module.named_parameters(recurse = False) if module != self else self._parameters.items(),
-            prefix = prefix, recurse = recurse)
-        for name, param in gen:
-            if param.numel() > 0:
-                yield name, param
-        

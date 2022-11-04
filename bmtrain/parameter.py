@@ -3,6 +3,7 @@ import torch
 from .utils import round_up
 from .global_var import config
 from . import nccl
+import warnings
 
 class DistributedParameter(torch.nn.Parameter):
     r"""
@@ -61,13 +62,94 @@ class DistributedParameter(torch.nn.Parameter):
         setattr(ret, "_init_method", init_method)
         setattr(ret, "_in_checkpoint_block", False)
         setattr(ret, "_group", group)
+        setattr(ret, "_cpu_parameter", None)
+        setattr(ret, "_on_host", False)
+        setattr(ret, "_on_device", True)
         return ret
+
+    def _set_partition(self, start_of_partition, end_of_partition):
+        setattr(self, "_start_partition", start_of_partition)
+        setattr(self, "_end_partition", end_of_partition)
     
     @property
     def group(self):
         """The group name of the distributed parameter."""
 
         return self._group
+
+    @property
+    def cpu_parameter(self):
+        return self._cpu_parameter
+    
+    @property
+    def on_host(self):
+        return self._on_host
+    
+    @property
+    def on_device(self):
+        return self._on_device
+
+    def allocate_cpu_storage(self):
+        assert self.cpu_parameter is None
+        assert not self.on_host
+        data = self.data
+        cpu_tensor = torch.empty(data.size(), dtype=data.dtype, pin_memory=True)
+        cpu_tensor.copy_(self.data, non_blocking = False) # ?
+        cpu_param = torch.nn.Parameter(cpu_tensor)
+        if self.requires_grad:
+            cpu_param.requires_grad_(True)
+            cpu_param.grad = torch.empty(data.size(), dtype=data.dtype, pin_memory=True)
+        else:
+            cpu_param.requires_grad_(False)
+        setattr(self, "_cpu_parameter", cpu_param)
+        setattr(self, "_on_host", True)
+
+    def release_gpu_storage(self):
+        # Only offloaded parameters support release_gpu_storage
+        assert self.on_host
+        assert self.on_device
+        self.data = torch.tensor([], dtype=self.dtype, device=self.device)
+        self.grad = None
+        setattr(self, "_on_device", False)
+
+    def allocate_gpu_storage(self, storage = None, offset = 0):
+        assert self.on_host
+        assert not self.on_device
+        cuda_tensor = torch.tensor([], dtype=self.dtype, device="cuda")
+        cuda_tensor_size = self.cpu_parameter.size()
+        if storage is None:
+            cuda_storage_size = self.cpu_parameter.numel()
+            cuda_storage = cuda_tensor.storage_type()(cuda_storage_size)
+            cuda_tensor.set_(cuda_storage, 0, cuda_tensor_size)
+        else:
+            cuda_tensor.set_(storage, offset, cuda_tensor_size)
+        self.data = cuda_tensor
+        setattr(self, "_on_device", True)
+
+    def prefetch(self, allocate_gpu_storage : bool, non_blocking : bool = False):
+        assert self.on_host
+        if allocate_gpu_storage:
+            self.allocate_gpu_storage()
+        assert self.on_device
+        assert self.data.shape == self.cpu_parameter.data.shape
+        self.data.copy_(self.cpu_parameter.data, non_blocking = non_blocking)
+
+    def offload(self, release_gpu_storage : bool, non_blocking : bool = False, grad = None):
+        assert self.on_device
+        assert self.on_host
+        if grad is None:
+            grad = self.grad
+            specified_grad = False
+        else:
+            specified_grad = True
+        if self.requires_grad and grad is not None:
+            _g = torch.empty(grad.size(), dtype=grad.dtype, pin_memory=True)
+            _g.copy_(grad, non_blocking = non_blocking)
+            self.cpu_parameter.grad += _g
+        if release_gpu_storage:
+            self.release_gpu_storage()
+        elif not specified_grad:
+            self.grad = None
 
     def gather(self) -> torch.Tensor:
         """Gather the data from all the distributed nodes.
@@ -84,13 +166,24 @@ class DistributedParameter(torch.nn.Parameter):
         return output_tensor
 
     def _copy_data(self, data : torch.Tensor):
-        self.data.copy_(data.view(-1)[self._start_partition : self._end_partition])
+        if self.on_device:
+            self.data.copy_(data.view(-1)[self._start_partition : self._end_partition])
+        if self.on_host:
+            self.cpu_parameter.data.copy_(data.view(-1)[self._start_partition : self._end_partition])
     
 
 class OpAllGather(torch.autograd.Function):
     @staticmethod
     def forward(ctx, value : DistributedParameter):
         assert isinstance(value, DistributedParameter)
+
+        # TODO : prefetch before gathering & offload after scattering
+        if not value.on_device:
+            assert value.on_host
+            value.prefetch(allocate_gpu_storage = True)
+            ctx.release_gpu_after_backward = True
+        else:
+            ctx.release_gpu_after_backward = False
 
         partition_size = value.storage().size()
         global_size = partition_size * config['world_size']
@@ -108,6 +201,7 @@ class OpAllGather(torch.autograd.Function):
     
         ctx.partition_size = partition_size
         ctx.tensor_size = value.size(0)
+        ctx.value = value
         return output_tensor
     
     @staticmethod
@@ -129,6 +223,16 @@ class OpAllGather(torch.autograd.Function):
         )
         grad_tensor = torch.tensor([], dtype=grad_output.dtype, device="cuda")
         grad_tensor.set_(grad_storage, 0, (ctx.tensor_size,))
+        
+        value = ctx.value
+        if value.on_host:
+            if ctx.release_gpu_after_backward:
+                value.offload(release_gpu_storage = True, grad = grad_tensor)
+                return None
+            else:
+                value.offload(release_gpu_storage = False, grad = grad_tensor)
+                return grad_tensor
+
         return grad_tensor
 
 class ParameterInitializer:
