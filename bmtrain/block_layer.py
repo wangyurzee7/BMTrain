@@ -127,12 +127,40 @@ class CheckpointBlockContext:
         self._param_tensor = {}
         self._grad_tensor = {}
         self.flag = flag
+        self.gather_event = torch.cuda.Event()
         self._need_release = False
+        self._grad_ready = False
+        self._param_ready = False
         if pipe:
             self.comm = config["zero_comm"] 
         else:
             self.comm = config["comm"]
-    def enter(self):
+
+    def enter_prefetch(self):
+        """
+        prefetch parameters
+        """
+        if self.flag == 2:
+            return
+        if not self.block._offload:
+            assert self.block._on_device
+            return
+        assert not self.block._on_device
+        self.block._on_device = True
+        config["prefetch_stream"].wait_stream(config["offload_stream"])
+        with torch.cuda.stream(config["prefetch_stream"]):
+            self.block.init_storage_buffers(offload = False)
+            for param in self.block._param_info:
+                if "begin" in param:
+                    offset = param["begin"]
+                    kw_name = param["kw_name"]
+                    storage = self.block._storage_params[kw_name].storage()
+                    param["parameter"].allocate_gpu_storage(storage = storage, offset = offset)
+            for param in self.block._param_info:
+                if "begin" in param:
+                    param["parameter"].prefetch(allocate_gpu_storage = False, non_blocking = True)
+
+    def enter_gather(self):
         """
         gather parameters
         """
@@ -141,25 +169,22 @@ class CheckpointBlockContext:
         self.block._ready = True
         self._need_release = True
 
-        wait_loader()
-        requires_grad = torch.is_grad_enabled()
+        # wait_loader()
+        # config["load_stream"].wait_stream(config["prefetch_stream"])
         with torch.cuda.stream(config["load_stream"]):
-            if self.block._offload:
-                self.block._prefetch_params()
+            assert self.block._on_device
+            for param in self.block._param_info:
+                param["parameter"].event.wait()
             for kw, val in self.block._storage_info.items():
                 assert self.block._storage_params[kw].is_cuda
-                assert kw not in self._grad_buffer
                 assert kw not in self._param_buffer
-                local_param = self.block._storage_params[kw]    
-           
+
+                local_param = self.block._storage_params[kw]
                 storage_type = local_param.storage_type()
                 if self.flag != 2:
                     self._param_buffer[kw] = storage_type(val["partition_size"] * val["world_size"])
                     self._param_tensor[kw] = torch.tensor([], dtype=self._param_buffer[kw].dtype, device=self._param_buffer[kw].device).set_(self._param_buffer[kw])
 
-                if requires_grad and local_param.requires_grad:
-                    self._grad_buffer[kw] = storage_type(val["partition_size"] * val["world_size"])
-                    self._grad_tensor[kw] = torch.tensor([], dtype=self._grad_buffer[kw].dtype, device=self._grad_buffer[kw].device).set_(self._grad_buffer[kw]).zero_()
             if self.flag != 2:
                 nccl.groupStart()
                 for kw, val in self.block._storage_info.items():
@@ -169,39 +194,102 @@ class CheckpointBlockContext:
                         self.comm
                     )
                 nccl.groupEnd()
+            for param in self.block._param_info:
+                param["parameter"].event.record()
 
+            self.gather_event.record()
+    
+    def enter_build_param(self):
+        self.gather_event.wait()
         current_stream = torch.cuda.current_stream()
-        current_stream.wait_stream(config["load_stream"])
-        
-        # set wait stream for each storage
-        for kw in self.block._storage_info.keys():
-            if self.flag != 2:
-                self._param_tensor[kw].record_stream(current_stream)
-            if requires_grad and kw in self._grad_tensor:
-                self._grad_tensor[kw].record_stream(current_stream)
 
-        # update parameters in block
-        for param in self.block._param_info:
-            kw_name = param["kw_name"]
-            offset = param["offset"]
-            shape = param["shape"]
+        if not self._param_ready:
+            self._param_ready = True
+            # set wait stream for each storage
+            for kw in self.block._storage_info.keys():
+                if self.flag != 2:
+                    self._param_tensor[kw].record_stream(current_stream)
 
-            if self.flag != 2:
-                dtype = self._param_buffer[kw_name].dtype
-                device = self._param_buffer[kw_name].device
-                param["parameter"].data = torch.tensor([], dtype=dtype, device=device).set_(self._param_buffer[kw_name], offset, shape)                
-            else:
-                dtype = param["parameter"].data.dtype
-                device = param["parameter"].data.device
-                param["parameter"].data = torch.tensor([], dtype=dtype, device=device).set_(self.ctx_dict[kw_name], offset, shape)
+            # update parameters in block
+            for param in self.block._param_info:
+                kw_name = param["kw_name"]
+                offset = param["offset"]
+                shape = param["shape"]
 
-            if requires_grad and kw_name in self._grad_buffer and param["parameter"].requires_grad:
-                param["parameter"].grad = torch.tensor([], dtype=dtype, device=device).set_(self._grad_buffer[kw_name], offset, shape)
+                if self.flag != 2:
+                    dtype = self._param_buffer[kw_name].dtype
+                    device = self._param_buffer[kw_name].device
+                    param["parameter"].data = torch.tensor([], dtype=dtype, device=device).set_(self._param_buffer[kw_name], offset, shape)                
+                else:
+                    dtype = param["parameter"].data.dtype
+                    device = param["parameter"].data.device
+                    param["parameter"].data = torch.tensor([], dtype=dtype, device=device).set_(self.ctx_dict[kw_name], offset, shape)
+
+        requires_grad = torch.is_grad_enabled()
+        if requires_grad and not self._grad_ready:
+            self._grad_ready = True
+            for kw, val in self.block._storage_info.items():
+                assert kw not in self._grad_buffer
+
+                local_param = self.block._storage_params[kw]
+                storage_type = local_param.storage_type()
+                if local_param.requires_grad:
+                    self._grad_buffer[kw] = storage_type(val["partition_size"] * val["world_size"])
+                    self._grad_tensor[kw] = torch.tensor([], dtype=self._grad_buffer[kw].dtype, device=self._grad_buffer[kw].device).set_(self._grad_buffer[kw]).zero_()
+                if kw in self._grad_tensor:
+                    self._grad_tensor[kw].record_stream(current_stream)
+
+            for param in self.block._param_info:
+                kw_name = param["kw_name"]
+                offset = param["offset"]
+                shape = param["shape"]
+
+                if self.flag != 2:
+                    dtype = self._param_buffer[kw_name].dtype
+                    device = self._param_buffer[kw_name].device
+                else:
+                    dtype = param["parameter"].data.dtype
+                    device = param["parameter"].data.device
+                if kw_name in self._grad_buffer and param["parameter"].requires_grad:
+                    param["parameter"].grad = torch.tensor([], dtype=dtype, device=device).set_(self._grad_buffer[kw_name], offset, shape)
+
+
+
+
+    def enter(self):
+        self.enter_prefetch()
+        self.enter_gather()
+        self.enter_build_param()
 
     def __enter__(self):
         self.enter()
     
-    def exit(self):
+    def exit_offload(self):
+        """
+        offload gradients
+        """
+        if self.flag == 1:
+            return
+        requires_grad = torch.is_grad_enabled()
+        # config["offload_stream"].wait_stream(config["load_stream"])
+        config["offload_stream"].wait_stream(config["prefetch_stream"])
+        with torch.cuda.stream(config["offload_stream"]):
+            assert self.block._on_device
+            for param in self.block._param_info:
+                if "begin" not in param:
+                    continue
+                param = param["parameter"]
+                if requires_grad and param.requires_grad:
+                    param.offload(release_gpu_storage = False, non_blocking = True)
+            if self.block._offload:
+                for param in self.block._param_info:
+                    if "begin" in param:
+                        param["parameter"].release_gpu_storage()
+                self.block._on_device = False
+                self.block.init_storage_buffers(offload = True)
+
+
+    def exit_scatter(self):
         """
         Reduce scatter gradients
         """
@@ -210,6 +298,8 @@ class CheckpointBlockContext:
             return
         self._need_release = False
         self.block._ready = False
+        self._grad_ready = False
+        self._param_ready = False
         requires_grad = torch.is_grad_enabled()
         if requires_grad:
             for kw, val in self.block._storage_info.items():
@@ -240,6 +330,9 @@ class CheckpointBlockContext:
                             self.comm
                         )
                 nccl.groupEnd()
+                for param in self.block._param_info:
+                    param["parameter"].event.record()
+
 
             # set wait stream for each storage
             for kw in self._grad_tensor.keys():
@@ -263,18 +356,22 @@ class CheckpointBlockContext:
         if self.flag == 1:
             for i in self._param_buffer:
                 self.ctx_dict[i] = self._param_buffer[i]
-        if self.block._offload:
-            self.block._offload_grads(release_gpu_storage = True)
-        else:
-            self.block._offload_grads(release_gpu_storage = False)
 
         self._grad_tensor = {}
         self._param_tensor = {}
         self._grad_buffer = {}
         self._param_buffer = {}
-    def __exit__(self, exc_type, exc_val, exc_tb):
+        config["load_stream"].record_event(config["load_event"])
+
+    def exit(self):
         # reduce scatter gradients
-        self.exit()
+        self.exit_scatter()
+        self.exit_offload()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.exit(exc_type, exc_val, exc_tb)
+
+
 
 def _storage_type(storage_type, to):
     to = to.lower().strip()
@@ -474,39 +571,21 @@ class CheckpointBlock(torch.nn.Module):
                 storage_param.requires_grad_(False)
             self._storage_params[kw] = storage_param
     
-    def _prefetch_params(self):
-        assert self._offload
-        assert not self._on_device
-        self._on_device = True
-        with torch.cuda.stream(config["load_stream"]):
-            self.init_storage_buffers(offload = False)
-            for param in self._param_info:
-                if "begin" not in param:
-                    continue
-                offset = param["begin"]
-                kw_name = param["kw_name"]
-                storage = self._storage_params[kw_name].storage()
-                param["parameter"].allocate_gpu_storage(storage = storage, offset = offset)
-                param["parameter"].prefetch(allocate_gpu_storage = False)
-
-    def _offload_grads(self, release_gpu_storage):
-        assert self._on_device
-        if release_gpu_storage:
-            self._on_device = False
-        requires_grad = torch.is_grad_enabled()
-        with torch.cuda.stream(config["load_stream"]):
-            for param in self._param_info:
-                if "begin" not in param:
-                    continue
-                param = param["parameter"]
-                if requires_grad and param.requires_grad:
-                    param.offload(release_gpu_storage = False)
-                if release_gpu_storage:
-                    param.release_gpu_storage()
-        if self._offload:
-            for p in self._storage_params.values():
-                p.record_stream(config["load_stream"])
-            self.init_storage_buffers(offload = True)
+    @property
+    def offload(self):
+        return self._offload
+    @offload.setter
+    def offload(self, value):
+        assert type(value) == bool
+        if value == self._offload:
+            return
+        with torch.no_grad():
+            ctx = CheckpointBlockContext(self)
+            ctx.enter_prefetch()
+            self._offload = value
+            ctx.exit_offload()
+    def offload_(self, offload : bool = True):
+        self.offload = offload
 
     def __call__(self, *args, **kwargs):
         # gather here
@@ -602,15 +681,6 @@ class CheckpointBlock(torch.nn.Module):
             ret[val["group"]].append(self._storage_params[kw])
         for kw, val in ret.items():
             yield kw, val
-
-    '''
-    def named_parameters(self, prefix: str = '', recurse: bool = True):
-        if self._offload:
-            for param in self._param_info:
-                if "parameter_cpu" in param:
-                    if param["parameter_cpu"].numel() > 0:
-                        yield param["name"], param["parameter_cpu"]
-    '''
 
     def init_parameters(self):
         """
@@ -755,13 +825,15 @@ class OpTransformerBlockList(torch.autograd.Function):
             for i in range(len(self)):
                 if is_train and save_list[i][0] == i:
                     if offload_list[i]:
-                        offload_hidden_state[i].copy_(hidden_state, non_blocking=True)
                         layer_inputs.append(offload_hidden_state[i])
+                        last_hidden_state = hidden_state.detach()
+                        # offload later
                     else:
                         layer_inputs.append(hidden_state.detach())
-                    cuda_rng_state.append( torch.cuda.get_rng_state() )
                 elif self.return_hidden_states:
                     layer_inputs.append(hidden_state.detach())
+                if is_train:
+                    cuda_rng_state.append( torch.cuda.get_rng_state() )
 
                 if config['zero_level']==2:
                     flag = 1
@@ -769,8 +841,16 @@ class OpTransformerBlockList(torch.autograd.Function):
                     flag = 0
                 block_ctx = CheckpointBlockContext(self._modules[str(i)], ctx.layers_dict[i], flag)
                 # gather parameter on load stream
-                block_ctx.enter()
+                block_ctx.enter_prefetch()
+                block_ctx.enter_gather()
+                if offload_list[i]:
+                    config["offload_stream"].wait_stream(config["prefetch_stream"])
+                    config["offload_stream"].wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(config["offload_stream"]):
+                        offload_hidden_state[i].copy_(last_hidden_state, non_blocking = True)
+                    last_hidden_state.record_stream(config["offload_stream"])
                 # call inner module directly
+                block_ctx.enter_build_param()
                 with ScopedTensorInspectorContext() as inspector:
                     hidden_state = self._modules[str(i)]._module._call_impl(hidden_state, *args)
                 for it in inspector.hidden_states:
@@ -795,17 +875,51 @@ class OpTransformerBlockList(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_hidden_state : torch.Tensor, grad_middle: List[torch.Tensor]):
-        def exit_prev(prev_ctx, prev_grad):
-            if prev_ctx is not None:
-                if prev_grad:
-                    with torch.enable_grad():
-                        prev_ctx.exit()
-                        config["load_stream"].record_event(config["load_event"])
+        def enter_next(next_ctx, op = None):
+            if next_ctx is not None:
+                if op is None:
+                    next_ctx.enter()
+                elif op == "prefetch":
+                    next_ctx.enter_prefetch()
+                elif op == "gather":
+                    next_ctx.enter_gather()
                 else:
-                    with torch.no_grad():
+                    raise NotImplementedError
+                    
+
+        def exit_prev(prev_ctx, prev_grad, op = None):
+            if prev_ctx is not None:
+                grad_context = torch.enable_grad if prev_grad else torch.no_grad
+                with grad_context():
+                    if op is None:
                         prev_ctx.exit()
-                        config["load_stream"].record_event(config["load_event"])
-                
+                    elif op == "scatter":
+                        prev_ctx.exit_scatter()
+                    elif op == "offload":
+                        prev_ctx.exit_offload()
+                    else:
+                        raise NotImplementedError
+        
+
+        def prefetch_input(layer_inputs, save_list, next_st, event):
+            if next_st < 0:
+                return
+            _i = save_list[next_st][1]
+            if layer_inputs[_i].is_cuda:
+                return
+            config["prefetch_stream"].wait_stream(config["offload_stream"])
+            with torch.cuda.stream(config["prefetch_stream"]):
+                src = layer_inputs[_i]
+                dst = torch.empty(src.size(), dtype=src.dtype, device="cuda")
+                dst.requires_grad_(True)
+                dst.data.copy_(src.data, non_blocking = True)
+                event.record()
+                event.wait()
+            config["offload_stream"].wait_stream(config["prefetch_stream"])
+            config["offload_stream"].wait_event(event)
+            layer_inputs[_i] = dst
+
+
         if not torch.autograd._is_checkpoint_valid():
             raise RuntimeError(
                 "Checkpointing is not compatible with .grad() or when an `inputs` parameter"
@@ -815,6 +929,7 @@ class OpTransformerBlockList(torch.autograd.Function):
         input_requires_grad = []
         
         layer_inputs = ctx.saved_tensors[:ctx.num_save_needed]
+        layer_inputs = list(layer_inputs)
         save_args = ctx.saved_tensors[ctx.num_save_needed:]
         for tensor, other in zip(save_args, ctx.nontensor_inputs):
             if tensor is None:
@@ -827,58 +942,73 @@ class OpTransformerBlockList(torch.autograd.Function):
                 nw_tensor.requires_grad = tensor.requires_grad
                 all_inputs.append(nw_tensor)
         
-        if ctx.offloading_checkpoint:
-            ipt_pf = torch.empty(ctx.hidden_size, dtype=grad_hidden_state.dtype, device=grad_hidden_state.device)
-            ipt_pf.requires_grad_(True)
-            # ipt = torch.empty(ctx.hidden_size, dtype=grad_hidden_state.dtype, device=grad_hidden_state.device)
-            # ipt = torch.tensor([], dtype=grad_hidden_state.dtype, device=grad_hidden_state.device)
-            # ipt.requires_grad_(True)
-            ipt = ipt_pf
 
         with torch.random.fork_rng(devices=[torch.cuda.current_device()], enabled=True):
             with torch.enable_grad():
+                if config['zero_level'] == 2:
+                    flag = 2
+                else:
+                    flag = 0
+                blocks_ctx = []
+                prefetch_event = []
+                n = len(ctx.self)
+                for i in range(n):
+                    prefetch_event.append(torch.cuda.Event())
+                    blocks_ctx.append(CheckpointBlockContext(ctx.self._modules[str(i)], ctx.layers_dict[i], flag))
                 # overlap load and scatter here
-                prev_ctx = None
-                prev_grad = False
-                for i in reversed(range(len(ctx.self))):
+                prev_ctx, prev_grad, prev_st = None, False, n
+                next_st = ctx.save_list[-1][0]
+                next_ctx = blocks_ctx[next_st]
+                enter_next(next_ctx, op = "prefetch")
+                enter_next(next_ctx, op = "gather")
+                prefetch_input(layer_inputs, ctx.save_list, next_st, prefetch_event[next_st])
+                for i in reversed(range(n)):
                     if ctx.save_list[i][0] != i:
                         with torch.no_grad():
                             st = ctx.save_list[i][0]
                             for j in range(st, i):
                                 torch.cuda.set_rng_state(ctx.cuda_rng_state[j])
-                                if config['zero_level'] == 2:
-                                    flag = 2
-                                else:
-                                    flag = 0
-                                block_ctx = CheckpointBlockContext(ctx.self._modules[str(j)], ctx.layers_dict[j], flag)
-                                block_ctx.enter()
-                                exit_prev(prev_ctx, prev_grad)
+
+                                curr_ctx = blocks_ctx[j]
+                                next_ctx = blocks_ctx[j+1]
+                                config["prefetch_stream"].wait_stream(torch.cuda.current_stream())
+                                exit_prev(prev_ctx, prev_grad, op = "scatter")
+                                enter_next(next_ctx, op = "prefetch")
+                                enter_next(next_ctx, op = "gather")
+                                exit_prev(prev_ctx, prev_grad, op = "offload")
+
+                                curr_ctx.enter_build_param()
+                                prefetch_event[i].wait()
                                 output = ctx.self._modules[str(j)]._module._call_impl(layer_inputs[ctx.save_list[j][1]], *all_inputs)
-                                prev_ctx = block_ctx
-                                prev_grad = False
-                                layer_inputs[ctx.save_list[j+1][1]].copy_(output)
+                                prev_ctx, prev_grad, prev_st = curr_ctx, False, j
+                                layer_inputs[ctx.save_list[j+1][1]] = output
                                 ctx.save_list[j+1][0] = j+1
+                                ctx.offload_list[j+1] = False
                 
                     torch.cuda.set_rng_state(ctx.cuda_rng_state[i])
-                    if ctx.offload_list[i]:
-                        ipt.data.copy_(layer_inputs[ctx.save_list[i][1]].data, non_blocking=True)
-                        ipt.grad = None
-                    else:
-                        ipt = layer_inputs[ctx.save_list[i][1]].requires_grad_(True)
+                    
+                    ipt = layer_inputs[ctx.save_list[i][1]].requires_grad_(True)
+                    assert ipt.is_cuda
 
-                    if config['zero_level'] == 2:
-                        flag = 2
-                    else:
-                        flag = 0
-                    block_ctx = CheckpointBlockContext(ctx.self._modules[str(i)], ctx.layers_dict[i], flag)
-                    block_ctx.enter()
-                    exit_prev(prev_ctx, prev_grad)
-                    prev_ctx = block_ctx
-                    prev_grad = True
+                    config["prefetch_stream"].wait_stream(torch.cuda.current_stream())
+                    curr_ctx = blocks_ctx[i]
+                    next_st = ctx.save_list[i-1][0] if i>0 else -1
+                    next_ctx = blocks_ctx[next_st] if i>0 else None
+                    if prev_st == next_st:
+                        next_ctx, prev_ctx = None, None
+                    exit_prev(prev_ctx, prev_grad, op = "scatter")
+                    enter_next(next_ctx, op = "prefetch")
+                    if True: # TODO: API
+                        # mode 1 ( maybe faster )
+                        prefetch_input(layer_inputs, ctx.save_list, next_st, prefetch_event[next_st])
+                        enter_next(next_ctx, op = "gather")
+                        exit_prev(prev_ctx, prev_grad, op = "offload")
 
+                    curr_ctx.enter_build_param()
+                    prefetch_event[i].wait()
                     with ScopedTensorInspectorContext() as inspector:
                         output = ctx.self._modules[str(i)]._module._call_impl(ipt, *all_inputs)
-                    
+
                     assert len(ctx.layer_inspector[i]) == len(inspector.hidden_states), "Backward step changed"
                     for j, it in enumerate(inspector.hidden_states):
                         assert it["name"] == ctx.layer_inspector[i][j]["name"], "Backward step changed"
@@ -895,11 +1025,19 @@ class OpTransformerBlockList(torch.autograd.Function):
                     )
                     grad_hidden_state = ipt.grad
                     layer_inputs[ctx.save_list[i][1]].grad = None
+                    layer_inputs[ctx.save_list[i][1]] = None
                     if grad_middle is not None:
                         grad_hidden_state = grad_hidden_state + grad_middle[i]
 
-                exit_prev(prev_ctx, prev_grad)
+                    if False: # TODO: API
+                        # mode 2 ( less gpu memory )
+                        enter_next(next_ctx, op = "gather")
+                        exit_prev(prev_ctx, prev_grad, op = "offload")
+                        prefetch_input(layer_inputs, ctx.save_list, next_st, prefetch_event[next_st])
+                    prev_ctx, prev_grad, prev_st = curr_ctx, True, i
 
+
+                exit_prev(blocks_ctx[0], prev_grad)
 
         grads = []
         for inp, requires_grad in zip(all_inputs, input_requires_grad):

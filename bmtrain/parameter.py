@@ -5,6 +5,17 @@ from .global_var import config
 from . import nccl
 import warnings
 
+import threading
+
+grad_accumulation_lock = threading.Lock()
+def _grad_accumulation_cpu(dst, src, event):
+    event.synchronize()
+    grad_accumulation_lock.acquire()
+    dst += src
+    grad_accumulation_lock.release()
+
+
+
 class DistributedParameter(torch.nn.Parameter):
     r"""
     DistributedParameter is a subclass of torch.nn.Parameter.
@@ -65,6 +76,9 @@ class DistributedParameter(torch.nn.Parameter):
         setattr(ret, "_cpu_parameter", None)
         setattr(ret, "_on_host", False)
         setattr(ret, "_on_device", True)
+        setattr(ret, "_event", torch.cuda.Event())
+        setattr(ret, "_threads", [])
+        setattr(ret, "_grad_zeroed", False)
         return ret
 
     def _set_partition(self, start_of_partition, end_of_partition):
@@ -79,6 +93,7 @@ class DistributedParameter(torch.nn.Parameter):
 
     @property
     def cpu_parameter(self):
+        self.join()
         return self._cpu_parameter
     
     @property
@@ -89,8 +104,12 @@ class DistributedParameter(torch.nn.Parameter):
     def on_device(self):
         return self._on_device
 
+    @property
+    def event(self):
+        return self._event
+    
     def allocate_cpu_storage(self):
-        assert self.cpu_parameter is None
+        assert self._cpu_parameter is None
         assert not self.on_host
         data = self.data
         cpu_tensor = torch.empty(data.size(), dtype=data.dtype, pin_memory=True)
@@ -98,7 +117,8 @@ class DistributedParameter(torch.nn.Parameter):
         cpu_param = torch.nn.Parameter(cpu_tensor)
         if self.requires_grad:
             cpu_param.requires_grad_(True)
-            cpu_param.grad = torch.empty(data.size(), dtype=data.dtype, pin_memory=True)
+            cpu_param.grad = torch.empty(data.size(), dtype=data.dtype, pin_memory=True).zero_()
+            self._grad_zeroed = True
         else:
             cpu_param.requires_grad_(False)
         setattr(self, "_cpu_parameter", cpu_param)
@@ -106,19 +126,21 @@ class DistributedParameter(torch.nn.Parameter):
 
     def release_gpu_storage(self):
         # Only offloaded parameters support release_gpu_storage
+        self.event.wait()
         assert self.on_host
         assert self.on_device
         self.data = torch.tensor([], dtype=self.dtype, device=self.device)
         self.grad = None
         setattr(self, "_on_device", False)
+        self.event.record()
 
     def allocate_gpu_storage(self, storage = None, offset = 0):
         assert self.on_host
         assert not self.on_device
         cuda_tensor = torch.tensor([], dtype=self.dtype, device="cuda")
-        cuda_tensor_size = self.cpu_parameter.size()
+        cuda_tensor_size = self._cpu_parameter.size()
         if storage is None:
-            cuda_storage_size = self.cpu_parameter.numel()
+            cuda_storage_size = self._cpu_parameter.numel()
             cuda_storage = cuda_tensor.storage_type()(cuda_storage_size)
             cuda_tensor.set_(cuda_storage, 0, cuda_tensor_size)
         else:
@@ -127,12 +149,14 @@ class DistributedParameter(torch.nn.Parameter):
         setattr(self, "_on_device", True)
 
     def prefetch(self, allocate_gpu_storage : bool, non_blocking : bool = False):
+        self.event.wait()
         assert self.on_host
         if allocate_gpu_storage:
             self.allocate_gpu_storage()
         assert self.on_device
-        assert self.data.shape == self.cpu_parameter.data.shape
-        self.data.copy_(self.cpu_parameter.data, non_blocking = non_blocking)
+        assert self.data.shape == self._cpu_parameter.data.shape
+        self.data.copy_(self._cpu_parameter.data, non_blocking = non_blocking)
+        self.event.record()
 
     def offload(self, release_gpu_storage : bool, non_blocking : bool = False, grad = None):
         assert self.on_device
@@ -143,13 +167,32 @@ class DistributedParameter(torch.nn.Parameter):
         else:
             specified_grad = True
         if self.requires_grad and grad is not None:
-            _g = torch.empty(grad.size(), dtype=grad.dtype, pin_memory=True)
-            _g.copy_(grad, non_blocking = non_blocking)
-            self.cpu_parameter.grad += _g
+            self.event.wait()
+            self._copy_grad(self._cpu_parameter.grad, grad, self.event, non_blocking)
+            self.event.record()
+            self.event.wait()
+            grad.record_stream(torch.cuda.current_stream())
         if release_gpu_storage:
             self.release_gpu_storage()
         elif not specified_grad:
             self.grad = None
+
+    def _copy_grad(self, dst, src, event, non_blocking):
+        if self._grad_zeroed:
+            dst.copy_(src, non_blocking = non_blocking)
+            self._grad_zeroed = False
+        else:
+            _src = torch.empty(src.size(), dtype=src.dtype, pin_memory=True)
+            _src.copy_(src, non_blocking = non_blocking)
+            event.record()
+            t = threading.Thread(target=_grad_accumulation_cpu, args=(dst, _src, event))
+            t.start()
+            self._threads.append(t)
+
+    def join(self):
+        for t in self._threads:
+            t.join()
+        setattr(self, "_threads", [])
 
     def gather(self) -> torch.Tensor:
         """Gather the data from all the distributed nodes.

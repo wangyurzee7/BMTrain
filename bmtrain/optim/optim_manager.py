@@ -13,10 +13,10 @@ def check_overflow(param_groups):
     for group in param_groups:
         for p in group['params']:
             if p.grad is not None and p.dtype == torch.half: # TODO support other types
-                if p.grad.is_cuda:
+                if p.grad.on_device:
                     G.f_has_inf_nan(p.grad, has_inf_or_nan)
                 else: # TODO: C.f_has_inf_nan
-                    has_inf_or_nan += torch.isnan(p.grad).sum() + torch.isinf(p.grad).sum()
+                    has_inf_or_nan += torch.isnan(p.cpu_parameter.grad).sum() + torch.isinf(p.cpu_parameter.grad).sum()
 
     if "comm" in config:
         nccl.allReduce(has_inf_or_nan.storage(), has_inf_or_nan.storage(), "max", config["comm"])
@@ -98,6 +98,7 @@ class OptimManager:
         # some reduce ops of distributed parameter were launched on load stream
         current_stream = torch.cuda.current_stream()
         current_stream.wait_stream(config['load_stream'])
+        current_stream.wait_stream(config['offload_stream'])
 
     def zero_grad(self):
         """
@@ -115,6 +116,7 @@ class OptimManager:
 
         This function can also handle gradient overflow by reducing the loss scale when it occurs.
         """
+
         if self.loss_scale_enabled and self.loss_scale > 1:
             has_overflow = False
             for optimizer in self.optimizers:
@@ -128,7 +130,7 @@ class OptimManager:
                 self._justify_scale(self.loss_scale / self.loss_scale_factor)
                 self.zero_grad()
                 return
-                
+               
         for optimizer, lr_scheduler in zip(self.optimizers, self.lr_schedulers):
             if hasattr(optimizer, "_bmtrain_optimizer") and optimizer._bmtrain_optimizer:
                 optimizer.step(scale=self.loss_scale)
@@ -167,8 +169,12 @@ class OptimManager:
         grads = []
         parameters = [p for group in param_groups for p in group['params']]
         for p in parameters:
-            if p.grad is not None:
+            if p.on_host and p.cpu_parameter.grad is not None:
+                grads.append(p.cpu_parameter.grad)
+            elif p.grad is not None:
                 grads.append(p.grad.data)
+            elif p.on_host:
+                grads.append(torch.zeros_like(p.cpu_parameter.data))
             else:
                 grads.append(torch.zeros_like(p.data))
 
@@ -190,13 +196,15 @@ class OptimManager:
         clip_coef_cpu = None
         if clip_coef < 1:
             for p in parameters:
-                if p.grad is not None:
-                    if p.grad.is_cuda:
+                if p.on_device:
+                    if p.grad is not None:
                         p.grad.data.mul_(clip_coef)
-                    else:
+                if p.on_host:
+                    if p.cpu_parameter.grad is not None:
                         if clip_coef_cpu is None: # TODO: better implementation?
                             clip_coef_cpu = clip_coef.cpu() # TODO: error caused here!
-                        p.grad.data.mul_(clip_coef_cpu)
+                        p.cpu_parameter.grad.data.mul_(clip_coef_cpu)
+                    p.event.record()
         return total_norm / scale
 
     @torch.no_grad()

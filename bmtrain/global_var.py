@@ -11,6 +11,8 @@ class ConfigMap(TypedDict):
     calc_stream : torch.cuda.Stream
     load_stream : torch.cuda.Stream
     load_event : torch.cuda.Event
+    prefetch_stream : torch.cuda.Stream
+    offload_stream : torch.cuda.Stream
     barrier_stream : torch.cuda.Stream
     loss_scale_factor : float
     loss_scale_steps : int

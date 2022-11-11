@@ -32,7 +32,6 @@ class AdamOffloadOptimizer(torch.optim.Optimizer):
         super().__init__(params, defaults)
 
         self._hold_steps = hold_steps
-        self._events = {}
 
     @torch.no_grad()
     def step(self, closure=None, scale=1):
@@ -54,68 +53,46 @@ class AdamOffloadOptimizer(torch.optim.Optimizer):
         for group in self.param_groups:
             for p in group['params']:
                 if p.requires_grad:
-                    grad = p.cpu_parameter.grad if p.on_host else p.grad
-                    if grad is None:
-                        continue
-                    if grad.is_sparse:
-                        raise RuntimeError('Adam does not support sparse gradients, please consider SparseAdam instead')
+                    if not p.on_host:
+                        p.allocate_cpu_storage()
                     if p.dtype not in [torch.float16, torch.float32]:
                         raise RuntimeError('Adam only supports fp32 or fp16 gradients')
 
                     state = self.state[p]
                     # Lazy state initialization
                     if len(state) == 0:
-                        if not p.on_host:
-                            p.allocate_cpu_storage()
                         _p, p = p, p.cpu_parameter
                         state['step'] = 0
                         # Exponential moving average of gradient values
                         state['exp_avg'] = torch.zeros(p.size(), dtype=torch.float32, device="cpu")         # on host
                         # Exponential moving average of squared gradient values
                         state['exp_avg_sq'] = torch.zeros(p.size(), dtype=torch.float32, device="cpu")      # on host
-
                         if p.dtype == torch.half:
                             state['_param_fp32'] = torch.empty(p.size(), dtype=torch.float32, device="cpu")     # on host
                             state['_param_fp32'].copy_(p)
-
-                            state["_param_fp16"] = torch.tensor([], dtype=torch.float16, device="cpu").set_(p.data)  # on host
-                            state["_grad_fp16"] = torch.tensor([], dtype=torch.float16, device="cpu").set_(p.grad)  # on host
-                        else:
-                            state["_param_fp32"] = torch.tensor([], dtype=torch.float32, device="cpu").set_(p.data)  # on host
-                            state["_grad_fp32"] = torch.tensor([], dtype=torch.float32, device="cpu").set_(p.grad)  # on host
                         p = _p
-                    if p not in self._events:
-                        self._events[p] = torch.cuda.Event()
 
-                    update_params.append((p, state, self._events[p], group['betas'][0], group['betas'][1], group['eps'], group['lr'], group['weight_decay']))
+                    update_params.append((p, state, group['betas'][0], group['betas'][1], group['eps'], group['lr'], group['weight_decay']))
 
-        '''
-        # transfer parameters to host asynchronously
-        for param, state, event, _, _, _, _, _ in update_params:
-            if not param.is_cuda:
-                continue
-            if param.dtype == torch.half:
-                state["_grad_fp16"].copy_(param.grad, non_blocking=True)
-            else:
-                state["_grad_fp32"].copy_(param.grad, non_blocking=True)
-            torch.cuda.current_stream().record_event(event)
-        '''
-
-        for param, state, event, beta1, beta2, eps, lr, weight_decay in update_params:
+        for param, state, beta1, beta2, eps, lr, weight_decay in update_params:
             # wait for transfer to host
-            # event.synchronize()
+            param.event.synchronize()
+            if param.cpu_parameter.grad is None:
+                continue
+            if param.cpu_parameter.is_sparse:
+                raise RuntimeError('Adam does not support sparse gradients, please consider SparseAdam instead')
 
             state["step"] += 1
+            if ('maximize' in group) and (group['maximize'] is True):
+                grad = -param.cpu_parameter.grad
+            else:
+                grad = param.cpu_parameter.grad
 
             # update parameters
             if param.dtype == torch.half:
-                if ('maximize' in group) and (group['maximize'] is True):
-                    grad = -state["_grad_fp16"]
-                else:
-                    grad = state["_grad_fp16"]
                 C.f_adam_cpu(
                     state["_param_fp32"].view(-1),
-                    state["_param_fp16"].view(-1),
+                    param.cpu_parameter.data.view(-1),
                     grad.view(-1),
                     state["exp_avg"].view(-1),
                     state["exp_avg_sq"].view(-1),
@@ -127,18 +104,15 @@ class AdamOffloadOptimizer(torch.optim.Optimizer):
                 )
                 # transfer parameters back to device asynchronously
                 if param.on_device:
-                    param.copy_(state["_param_fp16"], non_blocking=True)
+                    with torch.cuda.stream(config["prefetch_stream"]):
+                        param.prefetch(allocate_gpu_storage = False)
             else:
-                state["_grad_fp32"].mul_(1.0 / scale)
-                if ('maximize' in group) and (group['maximize'] is True):
-                    grad = -state["_grad_fp32"]
-                else:
-                    grad = state["_grad_fp32"]
+                grad.mul_(1.0 / scale)
                 other_kwargs = {}
                 if 'maximize' in inspect.signature(F.adam).parameters:
                     other_kwargs['maximize'] = False
                 F.adam(
-                    [state["_param_fp32"]],
+                    [p.cpu_parameter.data],
                     [grad],
                     [state["exp_avg"]],
                     [state["exp_avg_sq"]],
@@ -154,7 +128,8 @@ class AdamOffloadOptimizer(torch.optim.Optimizer):
                 )
                 # transfer parameters back to device asynchronously
                 if param.on_device:
-                    param.copy_(state["_param_fp32"], non_blocking=True)
+                    with torch.cuda.stream(config["prefetch_stream"]):
+                        param.prefetch(allocate_gpu_storage = False)
 
         return loss
 
@@ -297,6 +272,7 @@ class AdamOffloadOptimizer(torch.optim.Optimizer):
                                 p.grad.zero_()
                             else:
                                 per_device_and_dtype_grads[p.grad.device][p.grad.dtype].append(p.grad)
+                    _p._grad_zeroed = True
             if foreach:
                 for _, per_dtype_grads in per_device_and_dtype_grads.items():
                     for grads in per_dtype_grads.values():
