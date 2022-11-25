@@ -5,6 +5,7 @@ from . import _cuda as G
 from .. import nccl
 import torch.optim._functional as F
 import inspect
+import time
 
 from copy import deepcopy
 from itertools import chain
@@ -82,6 +83,9 @@ class AdamOffloadOptimizer(torch.optim.Optimizer):
             if param.cpu_parameter.is_sparse:
                 raise RuntimeError('Adam does not support sparse gradients, please consider SparseAdam instead')
 
+            if param._optimizer_timer is not None:
+                param._optimizer_timer.enter()
+
             state["step"] += 1
             if ('maximize' in group) and (group['maximize'] is True):
                 grad = -param.cpu_parameter.grad
@@ -102,10 +106,6 @@ class AdamOffloadOptimizer(torch.optim.Optimizer):
                     weight_decay,
                     state["step"]
                 )
-                # transfer parameters back to device asynchronously
-                if param.on_device:
-                    with torch.cuda.stream(config["prefetch_stream"]):
-                        param.prefetch(allocate_gpu_storage = False)
             else:
                 grad.mul_(1.0 / scale)
                 other_kwargs = {}
@@ -126,10 +126,14 @@ class AdamOffloadOptimizer(torch.optim.Optimizer):
                     eps=eps,
                     **other_kwargs
                 )
-                # transfer parameters back to device asynchronously
-                if param.on_device:
-                    with torch.cuda.stream(config["prefetch_stream"]):
-                        param.prefetch(allocate_gpu_storage = False)
+            
+            if param._optimizer_timer is not None:
+                param._optimizer_timer.exit()
+
+            # transfer parameters back to device asynchronously
+            if param.on_device:
+                with torch.cuda.stream(config["prefetch_stream"]):
+                    param.prefetch(allocate_gpu_storage = False, non_blocking = True)
 
         return loss
 

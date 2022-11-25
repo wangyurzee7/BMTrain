@@ -79,6 +79,7 @@ class DistributedParameter(torch.nn.Parameter):
         setattr(ret, "_event", torch.cuda.Event())
         setattr(ret, "_threads", [])
         setattr(ret, "_grad_zeroed", False)
+        setattr(ret, "_optimizer_timer", None)
         return ret
 
     def _set_partition(self, start_of_partition, end_of_partition):

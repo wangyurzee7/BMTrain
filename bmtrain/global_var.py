@@ -1,19 +1,17 @@
 import torch
+from .block_optimization import BlockOptimization
 from typing_extensions import TypedDict
 class ConfigMap(TypedDict):
     rank : int
     local_rank : int
     world_size : int
     local_size : int
-    zero_level : int
     pipe_size : int
     num_micro_batches : int
     calc_stream : torch.cuda.Stream
     load_stream : torch.cuda.Stream
     load_event : torch.cuda.Event
-    prefetch_stream : torch.cuda.Stream
-    offload_stream : torch.cuda.Stream
-    barrier_stream : torch.cuda.Stream
+    default_block_optimization : BlockOptimization # zero_level is involved here
     loss_scale_factor : float
     loss_scale_steps : int
     topology : 'topology'

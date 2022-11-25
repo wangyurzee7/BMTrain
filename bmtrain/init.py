@@ -5,6 +5,7 @@ import torch.distributed as dist
 import os
 from .utils import print_dict
 from .global_var import config
+from .block_optimization import BlockOptimization, validate_boptim
 from . import nccl
 from .synchronize import synchronize
 def init_distributed(
@@ -13,6 +14,9 @@ def init_distributed(
         zero_level: int = 3,
         pipe_size: int = -1,
         num_micro_batches: int = None,
+        offload_parameter = False,
+        checkpointing = True,
+        offload_hidden_state = False,
     ):
     """Initialize distributed training.
     This function will initialize the distributed training, set the random seed and global configurations.
@@ -65,9 +69,16 @@ def init_distributed(
     config["offload_stream"] = torch.cuda.Stream(priority=-1)
     config['barrier_stream'] = torch.cuda.Stream()
     config["load_event"] = torch.cuda.Event()
-    config["zero_level"] = zero_level
     config["topology"] = topology(config)
     config["zero_rank"] = config["topology"].get_group_rank("zero") if pipe_size > 1 else config['rank']
+    config["default_block_optimization"] = validate_boptim(BlockOptimization(
+        zero_level = zero_level,
+        offload_parameter = offload_parameter,
+        checkpointing = checkpointing,
+        offload_hidden_state = offload_hidden_state,
+        economical_forward = False,
+        economical_backward = True,
+    ))
     cpus_this_worker = None
     
     all_available_cpus = sorted(list(os.sched_getaffinity(0)))
