@@ -10,6 +10,8 @@ class ConfigMap(TypedDict):
     num_micro_batches : int
     calc_stream : torch.cuda.Stream
     load_stream : torch.cuda.Stream
+    offload_stream : torch.cuda.Stream
+    prefetch_stream : torch.cuda.Stream
     load_event : torch.cuda.Event
     default_block_optimization : BlockOptimization # zero_level is involved here
     loss_scale_factor : float

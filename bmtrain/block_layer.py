@@ -4,7 +4,7 @@ from .utils import round_up
 from .global_var import config
 import torch
 from . import nccl
-from .synchronize import wait_loader
+from .synchronize import wait_loader, wait_all_stream
 from .parameter import DistributedParameter, OpAllGather
 from .checkpointing import ScopedTensorInspectorContext
 from . import debug
@@ -12,6 +12,7 @@ from .distributed import all_gather
 import copy
 import time
 import warnings
+from .blist_optimization import TBLAutoOptimization
 
 def _prefetch_hidden_state(src, profile, event = None, dst = None):
     config["prefetch_stream"].wait_stream(config["offload_stream"])
@@ -354,6 +355,9 @@ class CheckpointBlockContext:
                         param["parameter"].release_gpu_storage()
                 self.block._on_device = False
                 self.block.init_storage_buffers(offload = True)
+            else:
+                for kw in self.block._storage_params.keys():
+                    self.block._storage_params[kw].grad = None
 
 
     def exit_scatter(self):
@@ -423,6 +427,9 @@ class CheckpointBlockContext:
         if self.flag == 1:
             for i in self._param_buffer:
                 self.ctx_dict[i] = self._param_buffer[i]
+        else:
+            for i in self.ctx_dict:
+                self.ctx_dict[i] = None
 
         self._grad_tensor = {}
         self._param_tensor = {}
@@ -531,6 +538,15 @@ class ModelProfile:
         self.capacity = capacity
         self.runtime = {
             "optimizer_step": [],
+            "forward_no_grad": [],
+            "forward_with_grad": [],
+            "backward": [],
+            "prefetch_hidden_state": [],
+            "offload_hidden_state": [],
+            "prefetch_parameter": [],
+            "gather_parameter": [],
+            "scatter_gradient": [],
+            "offload_gradient": [],
         }
         self.curr_optimizer_runtime = []
         self.switch_on = True
@@ -538,6 +554,7 @@ class ModelProfile:
         self.memory = {
             "input_tensor": 0,
         }
+        self.convergent_keys = set()
     def input_recorder(self, input_tensor):
         if type(input_tensor) != list:
             input_tensor = [input_tensor]
@@ -578,6 +595,7 @@ class ModelProfile:
             if record_memory:
                 def memory_wb_func(delta, peak):
                     for k, v in [(key + "_delta", delta), (key + "_peak", peak)]:
+                        v = int(v)
                         if k in self.memory:
                             self.memory[k] = max(self.memory[k], v)
                         else:
@@ -606,19 +624,40 @@ class ModelProfile:
             runtime_wb_func = None
         return ModelProfile.RuntimeProfile(runtime_wb_func = runtime_wb_func)
         
-    def get_runtime(self, key = None, last_n = None, average = True):
+    def get_runtime(self, key = None, window_size = None, average = True):
         if key is None:
             ret = {}
             for key in self.runtime.keys():
-                ret[key] = self.get_runtime(key = key, last_n = last_n, average = average)
+                ret[key] = self.get_runtime(key = key, window_size = window_size, average = average)
             return ret
+        self.all_gather_runtime(key = key)
         arr = self.runtime[key]
-        if last_n is not None:
-            assert last_n > 0
-            arr = arr[-last_n:]
+        if window_size is not None:
+            assert window_size > 0
+            arr = arr[-window_size:]
         if average:
-            return float(torch.Tensor(arr).mean())
+            return float(torch.Tensor(arr).max(dim = 1).values.mean(dim = 0))
         return arr
+    
+    def convergence(self, window_size = 8, relative_error = 1/32):
+        self.all_gather_runtime()
+        ret = True
+        for key in self.runtime.keys():
+            if key in self.convergent_keys:
+                continue
+            if len(self.runtime[key]) < 2 * window_size:
+                ret = False
+                continue
+            curr_window = self.runtime[key][-window_size:]
+            prev_window = self.runtime[key][-2*window_size:-window_size]
+            curr_result = float(torch.Tensor(curr_window).max(dim = 1).values.mean(dim = 0))
+            prev_result = float(torch.Tensor(prev_window).max(dim = 1).values.mean(dim = 0))
+            if abs(prev_result - curr_result) / curr_result < relative_error:
+                self.convergent_keys.add(key)
+                self.runtime[key] = self.runtime[key][-2*window_size:]
+            else:
+                ret = False
+        return ret
 
     def all_gather_runtime(self, key = None):
         if key is None:
@@ -643,6 +682,7 @@ class ModelProfile:
             "capacity": self.capacity,
             "runtime": self.runtime,
             "memory": self.memory,
+            "convergent_keys": list(self.convergent_keys),
         }
         return ret
     @staticmethod
@@ -650,6 +690,7 @@ class ModelProfile:
         profile = ModelProfile(obj["capacity"])
         profile.runtime = obj["runtime"]
         profile.memory = obj["memory"]
+        profile.convergent_keys = set(obj["convergent_keys"])
         return profile
 
 class CheckpointBlock(torch.nn.Module):
@@ -677,7 +718,7 @@ class CheckpointBlock(torch.nn.Module):
         self._storage_params : Dict[str, torch.nn.Parameter] = {}
         self._storage_info = {}
         self._ready = False
-        self._optimization = config["default_block_optimization"]
+        self._optimization = copy.deepcopy(config["default_block_optimization"])
         if self.offload_parameter:
             self._on_device = False
         else:
@@ -844,32 +885,38 @@ class CheckpointBlock(torch.nn.Module):
 
         self.economical_forward = optim["economical_forward"]
         self.economical_backward = optim["economical_backward"]
+        self.segment_synchronization = optim["segment_synchronization"]
+
+    @property
+    def segment_synchronization(self):
+        return self._optimization["segment_synchronization"]
+    @segment_synchronization.setter
+    def segment_synchronization(self, value):
+        value = bool(value)
+        self._optimization["segment_synchronization"] = value
 
     @property
     def economical_forward(self):
         return self._optimization["economical_forward"]
-    
     @economical_forward.setter
     def economical_forward(self, value):
-        assert type(value) == bool
+        value = bool(value)
         self._optimization["economical_forward"] = value
 
     @property
     def economical_backward(self):
         return self._optimization["economical_backward"]
-    
     @economical_backward.setter
     def economical_backward(self, value):
-        assert type(value) == bool
+        value = bool(value)
         self._optimization["economical_backward"] = value
 
     @property
     def offload_parameter(self):
         return self._optimization["offload_parameter"]
-    
     @offload_parameter.setter
     def offload_parameter(self, value):
-        assert type(value) == bool
+        value = bool(value)
         if value == self._optimization["offload_parameter"]:
             return
         with torch.no_grad():
@@ -877,7 +924,6 @@ class CheckpointBlock(torch.nn.Module):
             ctx.enter_prefetch()
             self._optimization["offload_parameter"] = value
             ctx.exit_offload()
-
     def offload_parameter_(self, offload : bool = True):
         self.offload = offload
         return self
@@ -885,42 +931,36 @@ class CheckpointBlock(torch.nn.Module):
     @property
     def offload_hidden_state(self):
         return self._optimization["offload_hidden_state"]
-    
     @offload_hidden_state.setter
     def offload_hidden_state(self, value):
-        assert type(value) == bool
+        value = bool(value)
         if value == True and self.checkpointing == False:
             raise RuntimeError("Hidden state offloading conflicts with non-checkpointing. Please set checkpointing = True first.")
         self._optimization["offload_hidden_state"] = value
-    
     def offload_hidden_state_(self, value = True):
         slef.offload_hidden_state = value
 
     @property
     def checkpointing(self):
         return self._optimization["checkpointing"]
-    
     @checkpointing.setter
     def checkpointing(self, value):
-        assert type(value) == bool
+        value = bool(value)
         if value == False and self.offload_hidden_state == True:
             raise RuntimeError("Non-checkpointing conflicts with hidden state offloading. Please set checkpointing = True first.")
         self._optimization["checkpointing"] = value
-    
     def checkpointing_(self, value = True):
         self.checkpointing = value
 
     @property
     def zero_level(self):
         return self._optimization["zero_level"]
-    
     @zero_level.setter
     def zero_level(self, value):
         assert value == 3 or value == 2
         if value == self._optimization["zero_level"]:
             return
         self._optimization["zero_level"] = value
-    
     def zero_level_(self, value : int):
         self.zero_level = value
         return self
@@ -1156,7 +1196,11 @@ class OpTransformerBlockList(torch.autograd.Function):
             curr_ctx = block_ctxs[i]
             next_ctx = block_ctxs[i+1] if i < len(self) - 1 else None
 
+            if self._modules[str(i)].segment_synchronization:
+                wait_all_stream()
+
             config["prefetch_stream"].wait_stream(torch.cuda.current_stream())
+            config["load_stream"].wait_stream(torch.cuda.current_stream())
             with torch.no_grad():
                 if not self._modules[str(i)].economical_forward:
                     if i < len(self) - 1:
@@ -1164,6 +1208,7 @@ class OpTransformerBlockList(torch.autograd.Function):
                         next_ctx.enter_gather()
 
             hidden_state = hidden_state.detach().requires_grad_(True)
+
             if is_train and save_list[i][0] == i:
                 if offload_list[i]:
                     _offload_hidden_state(hidden_state, self._modules[str(i)].profile, dst = offload_hidden_state[i])
@@ -1202,6 +1247,7 @@ class OpTransformerBlockList(torch.autograd.Function):
 
             with torch.no_grad():
                 curr_ctx.exit()
+
 
         hidden_state = hidden_state.detach().requires_grad_(True)
         
@@ -1307,6 +1353,8 @@ class OpTransformerBlockList(torch.autograd.Function):
                         with torch.no_grad():
                             st = ctx.save_list[i][0]
                             for j in range(st, i):
+                                if ctx.self._modules[str(j)].segment_synchronization:
+                                    wait_all_stream()
                                 torch.cuda.set_rng_state(ctx.cuda_rng_state[j])
 
                                 curr_ctx = blocks_ctx[j]
@@ -1325,6 +1373,8 @@ class OpTransformerBlockList(torch.autograd.Function):
                                 ctx.save_list[j+1][0] = j+1
                                 ctx.offload_list[j+1] = False
                 
+                    if ctx.self._modules[str(i)].segment_synchronization:
+                        wait_all_stream()
                     torch.cuda.set_rng_state(ctx.cuda_rng_state[i])
                     
                     ipt = layer_inputs[ctx.save_list[i][1]].requires_grad_(True)
@@ -1332,6 +1382,7 @@ class OpTransformerBlockList(torch.autograd.Function):
 
                     config["prefetch_stream"].wait_stream(torch.cuda.current_stream())
                     curr_ctx = blocks_ctx[i]
+                    blocks_ctx[i] = None
                     next_st = ctx.save_list[i-1][0] if i>0 else -1
                     next_ctx = blocks_ctx[next_st] if i>0 else None
                     if prev_st == next_st:
@@ -1348,18 +1399,19 @@ class OpTransformerBlockList(torch.autograd.Function):
                     prefetch_event[i].wait()
 
                     if ctx.self._modules[str(i)].checkpointing:
-                        with ScopedTensorInspectorContext() as inspector, ctx.self._modules[str(i)].profile.timer("forward_with_grad"):
-                            output = ctx.self._modules[str(i)]._module._call_impl(ipt, *all_inputs)
+                        with ctx.self._modules[str(i)].profile.timer("forward_with_grad"):
+                            with ScopedTensorInspectorContext() as inspector:
+                                output = ctx.self._modules[str(i)]._module._call_impl(ipt, *all_inputs)
 
-                        assert len(ctx.layer_inspector[i]) == len(inspector.hidden_states), "Backward step changed"
-                        for j, it in enumerate(inspector.hidden_states):
-                            assert it["name"] == ctx.layer_inspector[i][j]["name"], "Backward step changed"
-                            assert it["shape"] == ctx.layer_inspector[i][j]["shape"], "Backward step changed"
-                            assert it["group"] == ctx.layer_inspector[i][j]["group"], "Backward step changed"
+                            assert len(ctx.layer_inspector[i]) == len(inspector.hidden_states), "Backward step changed"
+                            for j, it in enumerate(inspector.hidden_states):
+                                assert it["name"] == ctx.layer_inspector[i][j]["name"], "Backward step changed"
+                                assert it["shape"] == ctx.layer_inspector[i][j]["shape"], "Backward step changed"
+                                assert it["group"] == ctx.layer_inspector[i][j]["group"], "Backward step changed"
                         
-                            # change the tensor in placeholder
-                            ctx.layer_inspector[i][j]["requires_grad"] = it["requires_grad"]
-                            ctx.layer_inspector[i][j]["tensor"] = it["tensor"]
+                                # change the tensor in placeholder
+                                ctx.layer_inspector[i][j]["requires_grad"] = it["requires_grad"]
+                                ctx.layer_inspector[i][j]["tensor"] = it["tensor"]
                     else:
                         output = layer_outputs[i]
 
@@ -1368,13 +1420,13 @@ class OpTransformerBlockList(torch.autograd.Function):
                             [output],
                             [grad_hidden_state]
                         )
-                    grad_hidden_state = ipt.grad
-                    assert ipt.requires_grad
-                    assert ipt.grad is not None
-                    layer_inputs[ctx.save_list[i][1]].grad = None
-                    layer_inputs[ctx.save_list[i][1]] = None
-                    if grad_middle is not None:
-                        grad_hidden_state = grad_hidden_state + grad_middle[i]
+                        assert ipt.grad is not None
+                        grad_hidden_state = ipt.grad
+                        ipt = None
+                        layer_inputs[ctx.save_list[i][1]].grad = None
+                        layer_inputs[ctx.save_list[i][1]] = None
+                        if grad_middle is not None:
+                            grad_hidden_state = grad_hidden_state + grad_middle[i]
 
                     if ctx.self._modules[str(i)].economical_backward:
                         # ecomonical mode ( less gpu memory )
@@ -1383,8 +1435,7 @@ class OpTransformerBlockList(torch.autograd.Function):
                         prefetch_input(layer_inputs, ctx.save_list, next_st, prefetch_event[next_st], ctx.self._modules[str(next_st)].profile if next_st >= 0 else None)
                     prev_ctx, prev_grad, prev_st = curr_ctx, True, i
 
-
-                exit_prev(blocks_ctx[0], prev_grad)
+                exit_prev(prev_ctx, prev_grad)
 
         grads = []
         for inp, requires_grad in zip(all_inputs, input_requires_grad):
@@ -1447,6 +1498,11 @@ class TransformerBlockList(torch.nn.Module):
             self.save_list = save_list
         else:
             self.sqrt = False
+
+        if config["tbl_auto_optimization"]:
+            self._auto_optimization = TBLAutoOptimization(self)
+        else:
+            self._auto_optimization = None
             
     def __len__(self) -> int:
         return len(self._modules)
@@ -1456,6 +1512,8 @@ class TransformerBlockList(torch.nn.Module):
         return self._modules[str(index)]
 
     def forward(self, hidden_state, *args, return_hidden_states = False):
+        if self._auto_optimization is not None:
+            self._auto_optimization.before_step()
         self.return_hidden_states = return_hidden_states
         placeholder = torch.tensor([], requires_grad=torch.is_grad_enabled())
         if self.training and torch.is_grad_enabled():
@@ -1470,3 +1528,16 @@ class TransformerBlockList(torch.nn.Module):
             return last_hidden, middle_hiddens
         else:
             return last_hidden
+
+    def train(self, train = True):
+        super().train(train)
+        if self._auto_optimization is not None:
+            if train:
+                self._auto_optimization.train()
+            else:
+                self._auto_optimization.eval()
+
+    def is_profiling(self, i = None):
+        if self._auto_optimization is None:
+            return False
+        return self._auto_optimization.is_profiling(i = i)

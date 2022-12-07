@@ -5,18 +5,24 @@ import torch.distributed as dist
 import os
 from .utils import print_dict
 from .global_var import config
-from .block_optimization import BlockOptimization, validate_boptim
+from .block_optimization import BlockOptimization, validate_boptim, gen_tbl_optim_config
 from . import nccl
 from .synchronize import synchronize
 def init_distributed(
         init_method : str = "env://",
         seed : int = 0,
+
         zero_level: int = 3,
-        pipe_size: int = -1,
-        num_micro_batches: int = None,
         offload_parameter = False,
         checkpointing = True,
         offload_hidden_state = False,
+
+        tbl_auto_optimization = None,
+        tbl_memory_limit = None,
+        tbl_optimization_kwargs = None,
+
+        pipe_size: int = -1,
+        num_micro_batches: int = None,
     ):
     """Initialize distributed training.
     This function will initialize the distributed training, set the random seed and global configurations.
@@ -78,7 +84,13 @@ def init_distributed(
         offload_hidden_state = offload_hidden_state,
         economical_forward = False,
         economical_backward = True,
+        segment_synchronization = True,
     ))
+    config["tbl_auto_optimization"] = gen_tbl_optim_config(
+        tbl_auto_optimization = tbl_auto_optimization,
+        tbl_memory_limit = tbl_memory_limit,
+        tbl_optimization_kwargs = tbl_optimization_kwargs,
+    )
     cpus_this_worker = None
     
     all_available_cpus = sorted(list(os.sched_getaffinity(0)))

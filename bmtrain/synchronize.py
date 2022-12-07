@@ -23,6 +23,11 @@ def wait_loader():
     config['load_event'].synchronize()
     config['calc_stream'].record_event(config['load_event'])
 
+def wait_all_stream():
+    streams = [config[s] for s in ["calc_stream", "load_stream", "offload_stream", "prefetch_stream"]]
+    for s1 in streams:
+        for s2 in streams:
+            s1.wait_stream(s2)
 
 def sum_loss(loss : torch.Tensor):
     """
