@@ -947,7 +947,7 @@ class CheckpointBlock(torch.nn.Module):
     def checkpointing(self, value):
         value = bool(value)
         if value == False and self.offload_hidden_state == True:
-            raise RuntimeError("Non-checkpointing conflicts with hidden state offloading. Please set checkpointing = True first.")
+            raise RuntimeError("Non-checkpointing conflicts with hidden state offloading. Please set offload_hidden_state = False first.")
         self._optimization["checkpointing"] = value
     def checkpointing_(self, value = True):
         self.checkpointing = value
@@ -1147,6 +1147,12 @@ class OpTransformerBlockList(torch.autograd.Function):
         tensors = []
         others = []
         if is_train:
+            _args, args = args, []
+            for arg in _args:
+                if torch.is_tensor(arg):
+                    _req_grad = arg.requires_grad
+                    arg = arg.detach().requires_grad_(_req_grad)
+                args.append(arg)
             for arg in args:
                 if torch.is_tensor(arg):
                     tensors.append(arg)
@@ -1154,6 +1160,7 @@ class OpTransformerBlockList(torch.autograd.Function):
                 else:
                     tensors.append(None)
                     others.append(arg)
+
             ctx.nontensor_inputs = others
             ctx.self = self
             ctx.save_list = copy.deepcopy(save_list)
@@ -1324,10 +1331,7 @@ class OpTransformerBlockList(torch.autograd.Function):
             else:
                 # detach for tensor inputs
                 input_requires_grad.append( tensor.requires_grad )
-                nw_tensor = tensor.detach()
-                nw_tensor.requires_grad = tensor.requires_grad
-                all_inputs.append(nw_tensor)
-        
+                all_inputs.append(tensor)
 
         with torch.random.fork_rng(devices=[torch.cuda.current_device()], enabled=True):
             with torch.enable_grad():
