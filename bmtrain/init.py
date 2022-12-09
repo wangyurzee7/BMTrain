@@ -11,6 +11,7 @@ from .synchronize import synchronize
 def init_distributed(
         init_method : str = "env://",
         seed : int = 0,
+        nvlink_available : bool = True,
 
         zero_level: int = 3,
         offload_parameter = False,
@@ -70,9 +71,14 @@ def init_distributed(
     config["rank"] = rank
     config["world_size"] = world_size
     config["calc_stream"] = torch.cuda.current_stream()
+    config["nvlink_available"] = nvlink_available
     config["load_stream"] = torch.cuda.Stream(priority=-1)
-    config["prefetch_stream"] = torch.cuda.Stream(priority=-1)
-    config["offload_stream"] = torch.cuda.Stream(priority=-1)
+    if nvlink_available:
+        config["prefetch_stream"] = torch.cuda.Stream(priority=-1)
+        config["offload_stream"] = torch.cuda.Stream(priority=-1)
+    else:
+        config["prefetch_stream"] = config["load_stream"]
+        config["offload_stream"] = config["load_stream"]
     config['barrier_stream'] = torch.cuda.Stream()
     config["load_event"] = torch.cuda.Event()
     config["topology"] = topology(config)

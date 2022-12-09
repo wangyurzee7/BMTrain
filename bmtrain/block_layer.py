@@ -639,7 +639,7 @@ class ModelProfile:
             return float(torch.Tensor(arr).max(dim = 1).values.mean(dim = 0))
         return arr
     
-    def convergence(self, window_size = 8, relative_error = 1/32):
+    def convergence(self, window_size = 10, relative_error = 0.05):
         self.all_gather_runtime()
         ret = True
         for key in self.runtime.keys():
@@ -1074,8 +1074,7 @@ class CheckpointBlock(torch.nn.Module):
                 # PyTorch 1.11 changed the API of storage.__getitem__
                 d_dtype = self._storage_params[kw_name].dtype
                 d_device = self._storage_params[kw_name].device
-                param.data[:] = \
-                    torch.tensor([], dtype=d_dtype, device=d_device).set_(tmp_tensor.storage(), offset_st, (offset_end - offset_st,))[:]
+                param._copy_data(tmp_tensor)
                 del tmp_tensor
         
     def _named_members(self, get_members_fn, prefix='', recurse=True):
@@ -1377,27 +1376,37 @@ class OpTransformerBlockList(torch.autograd.Function):
                                 ctx.save_list[j+1][0] = j+1
                                 ctx.offload_list[j+1] = False
                 
-                    if ctx.self._modules[str(i)].segment_synchronization:
-                        wait_all_stream()
                     torch.cuda.set_rng_state(ctx.cuda_rng_state[i])
                     
                     ipt = layer_inputs[ctx.save_list[i][1]].requires_grad_(True)
                     assert ipt.is_cuda
 
+                    if ctx.self._modules[str(i)].segment_synchronization:
+                        wait_all_stream()
                     config["prefetch_stream"].wait_stream(torch.cuda.current_stream())
+
                     curr_ctx = blocks_ctx[i]
                     blocks_ctx[i] = None
                     next_st = ctx.save_list[i-1][0] if i>0 else -1
                     next_ctx = blocks_ctx[next_st] if i>0 else None
                     if prev_st == next_st:
                         next_ctx, prev_ctx = None, None
-                    exit_prev(prev_ctx, prev_grad, op = "scatter")
-                    enter_next(next_ctx, op = "prefetch")
-                    if not ctx.self._modules[str(i)].economical_backward:
-                        # speed mode ( maybe faster )
-                        prefetch_input(layer_inputs, ctx.save_list, next_st, prefetch_event[next_st], ctx.self._modules[str(next_st)].profile if next_st >= 0 else None)
-                        enter_next(next_ctx, op = "gather")
+
+                    if config["nvlink_available"]:
+                        exit_prev(prev_ctx, prev_grad, op = "scatter")
+                        enter_next(next_ctx, op = "prefetch")
+                        if not ctx.self._modules[str(i)].economical_backward:
+                            # speed mode ( maybe faster )
+                            prefetch_input(layer_inputs, ctx.save_list, next_st, prefetch_event[next_st], ctx.self._modules[str(next_st)].profile if next_st >= 0 else None)
+                            enter_next(next_ctx, op = "gather")
+                            exit_prev(prev_ctx, prev_grad, op = "offload")
+                    else:
+                        exit_prev(prev_ctx, prev_grad, op = "scatter")
                         exit_prev(prev_ctx, prev_grad, op = "offload")
+                        if not ctx.self._modules[str(i)].economical_backward:
+                            prefetch_input(layer_inputs, ctx.save_list, next_st, prefetch_event[next_st], ctx.self._modules[str(next_st)].profile if next_st >= 0 else None)
+                            enter_next(next_ctx, op = "prefetch")
+                            enter_next(next_ctx, op = "gather")
                     
                     curr_ctx.enter_build_param()
                     prefetch_event[i].wait()
@@ -1432,11 +1441,18 @@ class OpTransformerBlockList(torch.autograd.Function):
                         if grad_middle is not None:
                             grad_hidden_state = grad_hidden_state + grad_middle[i]
 
-                    if ctx.self._modules[str(i)].economical_backward:
-                        # ecomonical mode ( less gpu memory )
-                        enter_next(next_ctx, op = "gather")
-                        exit_prev(prev_ctx, prev_grad, op = "offload")
-                        prefetch_input(layer_inputs, ctx.save_list, next_st, prefetch_event[next_st], ctx.self._modules[str(next_st)].profile if next_st >= 0 else None)
+                    if config["nvlink_available"]:
+                        if ctx.self._modules[str(i)].economical_backward:
+                            # ecomonical mode ( less gpu memory )
+                            enter_next(next_ctx, op = "gather")
+                            exit_prev(prev_ctx, prev_grad, op = "offload")
+                            prefetch_input(layer_inputs, ctx.save_list, next_st, prefetch_event[next_st], ctx.self._modules[str(next_st)].profile if next_st >= 0 else None)
+                    else:
+                        if ctx.self._modules[str(i)].economical_backward:
+                            prefetch_input(layer_inputs, ctx.save_list, next_st, prefetch_event[next_st], ctx.self._modules[str(next_st)].profile if next_st >= 0 else None)
+                            enter_next(next_ctx, op = "prefetch")
+                            enter_next(next_ctx, op = "gather")
+
                     prev_ctx, prev_grad, prev_st = curr_ctx, True, i
 
                 exit_prev(prev_ctx, prev_grad)

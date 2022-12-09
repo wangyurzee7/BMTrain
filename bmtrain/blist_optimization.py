@@ -9,6 +9,7 @@ import json
 from .distributed import all_gather
 from itertools import product
 import copy
+import os
 
 # Scheduling Algorithms
 def naive_greedy_scheduling(n, profile_runtime, profile_memory, memory_limit):
@@ -105,7 +106,7 @@ def optim_tensor_all_reduce(optim_tensor, runtime):
 
 def random_scheduling(n, profile_runtime, profile_memory, memory_limit, rand_times = 10**3):
     found = False
-    best_optim_tensor, best_runtime = None, None
+    best_optim_tensor, best_runtime = torch.LongTensor([-1] * n), 1e9
     for _ in range(rand_times):
         optim_tensor = torch.randint(0, _n_block_optim, (config["world_size"], n))
         optim_tensor = optim_tensor[config["local_rank"]]
@@ -507,6 +508,8 @@ class TBLAutoOptimization:
         n = len(self.tbl._modules)
         profile_runtime = [self.tbl._modules[str(i)].profile.get_runtime() for i in range(n)]
         profile_memory = [self.tbl._modules[str(i)].profile.memory for i in range(n)]
+        self._layer_runtime = profile_runtime
+        self._layer_memory = profile_memory
 
         # Minimal Memory Test
         min_mem = ModelSimulator(
@@ -534,7 +537,9 @@ class TBLAutoOptimization:
             layer_memory = profile_memory,
             layer_optim = optim,
         ).simulate_train()
-        print_rank("Estimated runtime =", model_sim.max_runtime, ". Estimated memory =", model_sim.peak_memory)
+        print_rank("Estimated runtime =", model_sim.max_runtime, "sec. Estimated memory =", model_sim.peak_memory, "bytes.")
+        self._estimated_runtime = model_sim.max_runtime
+        self._estimated_memory = model_sim.peak_memory
 
         if _time_cost < 60:
             _time_cost = str(_time_cost) + "s"
@@ -556,13 +561,19 @@ class TBLAutoOptimization:
     def save(self, path = None):
         if config["local_rank"] == 0:
             if path is None:
-                path = f"tbloptim{time.time()}.json"
+                dir_name = ".tbl.optim.savings"
+                os.makedirs(dir_name, exist_ok=True)
+                path = os.path.join(dir_name, f"{time.time()}.json")
             dumped_obj = {
                 "optim_tensor": _optim2tensor(self.optimization).tolist(),
                 "optim": self.optimization,
                 "alg_name": self.alg_name,
+                "layer_runtime": self._layer_runtime,
+                "layer_memory": self._layer_memory,
             }
             json.dump(dumped_obj, open(path, "w"))
+            self.save_path = os.path.abspath(path)
+            print_rank(f"Optimization file saved path: {path}")
         
 
 class ModelSimulator:
@@ -723,6 +734,11 @@ class ModelSimulator:
 
     def new_task(self, stream_name, i, task_name):
         stream = config[stream_name]
+        if stream_name not in self.streams.values():
+            for name in self.streams.values():
+                if config[name] == stream:
+                    stream_name = name
+                    break
         self.logger.new_task(
             stream = stream_name,
             start = self.runtime[stream],
@@ -910,21 +926,40 @@ class ModelSimulator:
         if self.optim[i]["segment_synchronization"]:
             self.stream_synchronize()
         self.wait("prefetch_stream", "calc_stream")
-        self.scatter_gradient(i+1)
-        self.prefetch_parameter(i-1)
-        if not self.optim[i]["economical_backward"]:
-            self.prefetch_hidden_state(i-1)
-            self.gather_parameter(i-1)
+
+        if config["nvlink_available"]:
+            self.scatter_gradient(i+1)
+            self.prefetch_parameter(i-1)
+            if not self.optim[i]["economical_backward"]:
+                self.prefetch_hidden_state(i-1)
+                self.gather_parameter(i-1)
+                self.offload_gradient(i+1)
+        else:
+            self.scatter_gradient(i+1)
             self.offload_gradient(i+1)
+            if not self.optim[i]["economical_backward"]:
+                self.prefetch_hidden_state(i-1)
+                self.prefetch_parameter(i-1)
+                self.gather_parameter(i-1)
+
         self.build_parameter(i)
         self.wait("calc_stream", self.hidden_event[i])
         if self.optim[i]["checkpointing"]:
             self.forward_with_grad(i)
         self.backward(i)
-        if self.optim[i]["economical_backward"]:
-            self.gather_parameter(i-1)
-            self.offload_gradient(i+1)
-            self.prefetch_hidden_state(i-1)
+
+        if config["nvlink_available"]:
+            if self.optim[i]["economical_backward"]:
+                self.gather_parameter(i-1)
+                self.offload_gradient(i+1)
+                self.prefetch_hidden_state(i-1)
+        else:
+            if self.optim[i]["economical_backward"]:
+                self.prefetch_hidden_state(i-1)
+                self.prefetch_parameter(i-1)
+                self.gather_parameter(i-1)
+
+
 
         return self
 
