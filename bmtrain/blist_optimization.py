@@ -12,20 +12,6 @@ import copy
 import os
 
 # Scheduling Algorithms
-def naive_greedy_scheduling(n, profile_runtime, profile_memory, memory_limit):
-    optim = [config["default_block_optimization"]] * n
-    for i in reversed(range(n)):
-        mem = ModelSimulator(
-            layer_runtime = profile_runtime,
-            layer_memory = profile_memory,
-            layer_optim = optim,
-        ).simulate_train().peak_memory
-        if mem <= memory_limit:
-            return optim
-        else:
-            optim[i] = max_block_optim()
-    return optim
-
 
 def _all_valid_block_optimization():
     optims = []
@@ -91,7 +77,7 @@ def optim_tensor_all_reduce(optim_tensor, runtime):
         return None
     elif torch.is_tensor(valid_optim_tensor):
         return valid_optim_tensor
-    if config["local_rank"] == 0:
+    if config["rank"] == 0:
         found = False
         best_optim_tensor, best_runtime = None, None
         for i in range(runtime.shape[0]):
@@ -109,7 +95,7 @@ def random_scheduling(n, profile_runtime, profile_memory, memory_limit, rand_tim
     best_optim_tensor, best_runtime = torch.LongTensor([-1] * n), 1e9
     for _ in range(rand_times):
         optim_tensor = torch.randint(0, _n_block_optim, (config["world_size"], n))
-        optim_tensor = optim_tensor[config["local_rank"]]
+        optim_tensor = optim_tensor[config["rank"]]
         optim = _tensor2optim(optim_tensor)
         assert optim is not None
         model_sim = ModelSimulator(
@@ -122,16 +108,10 @@ def random_scheduling(n, profile_runtime, profile_memory, memory_limit, rand_tim
         if not found or model_sim.max_runtime < best_runtime:
             best_optim_tensor = optim_tensor
             best_runtime = model_sim.max_runtime
-    best_optim_tensor = optim_tensor_all_reduce(best_optim_tensor, best_runtime)
-    print_rank("[ random_scheduling ] best_optim_tensor = ", best_optim_tensor)
-    if best_optim_tensor is not None:
-        best_optim = _tensor2optim(best_optim_tensor)
-    else:
-        best_optim = [max_block_optim()] * n
-    return best_optim
+    return best_optim_tensor, best_runtime
 
 def greedy_scheduling(n, profile_runtime, profile_memory, memory_limit):
-    if config["local_rank"] == 0:
+    if config["rank"] == 0:
         best_optim = [max_block_optim()] * n
         best_runtime = ModelSimulator(
             layer_runtime = profile_runtime,
@@ -165,14 +145,11 @@ def greedy_scheduling(n, profile_runtime, profile_memory, memory_limit):
     else:
         best_optim_tensor = torch.LongTensor([-1] * n)
         best_runtime = 1e9
-    best_optim_tensor = optim_tensor_all_reduce(best_optim_tensor, best_runtime)
-    best_optim = _tensor2optim(best_optim_tensor)
-
-    return best_optim
+    return best_optim_tensor, best_runtime
 
 
 def dp_scheduling(n, profile_runtime, profile_memory, memory_limit, n_memory = 128):
-    if config["local_rank"] == 0:
+    if config["rank"] == 0:
         eps = 1e-6
         inf = 1e9
         n_state = 64
@@ -392,23 +369,23 @@ def dp_scheduling(n, profile_runtime, profile_memory, memory_limit, n_memory = 1
 
                 if result is None or runtime < result["runtime"]:
                     result = sol
-        assert result is not None
-        best_optim = result["optim_seq"]
+        if result is not None:
+            best_optim = result["optim_seq"]
+            best_runtime = result["runtime"]
+        else:
+            best_optim = [max_block_optim()] * n
+            best_runtime = 1e9
         best_optim_tensor = _optim2tensor(best_optim)
-        best_runtime = result["runtime"]
         print_rank("[ dp_scheduling ] best_optim_tensor =", best_optim_tensor)
         print_rank("[ dp_scheduling ] estimated runtime =", best_runtime)
     else:
         best_optim_tensor = torch.LongTensor([-1] * n)
         best_runtime = 1e9
-    best_optim_tensor = optim_tensor_all_reduce(best_optim_tensor, best_runtime)
-    best_optim = _tensor2optim(best_optim_tensor)
-    return best_optim
+    return best_optim_tensor, best_runtime
 
 
 algorithm_map = {
     "default": dp_scheduling,
-    "naive_greedy": naive_greedy_scheduling,
     "random": random_scheduling,
     "greedy": greedy_scheduling,
     "dp": dp_scheduling,
@@ -523,13 +500,18 @@ class TBLAutoOptimization:
         # Optimization
         print_rank(f"Scheduling auto optimization for TBL (algorithm name = {self.alg_name}) ... ")
         _start_time = time.time()
-        optim = self.scheduling_algorithm(
+        best_optim_tensor, best_runtime = self.scheduling_algorithm(
             n = n,
             profile_runtime = profile_runtime,
             profile_memory = profile_memory,
             memory_limit = self.memory_limit,
             **self.kwargs
         )
+        best_optim_tensor = optim_tensor_all_reduce(best_optim_tensor, best_runtime)
+        if best_optim_tensor is not None:
+            optim = _tensor2optim(best_optim_tensor)
+        else:
+            optim = [max_block_optim()] * n
         _time_cost = round(time.time() - _start_time, 2)
 
         model_sim = ModelSimulator(
@@ -559,7 +541,7 @@ class TBLAutoOptimization:
         self.optimization = optim
 
     def save(self, path = None):
-        if config["local_rank"] == 0:
+        if config["rank"] == 0:
             if path is None:
                 dir_name = ".tbl.optim.savings"
                 os.makedirs(dir_name, exist_ok=True)
