@@ -639,7 +639,7 @@ class ModelProfile:
             return float(torch.Tensor(arr).max(dim = 1).values.mean(dim = 0))
         return arr
     
-    def convergence(self, window_size = 10, relative_error = 0.05):
+    def convergence(self, window_size = 5, relative_error = 0.05):
         self.all_gather_runtime()
         ret = True
         for key in self.runtime.keys():
@@ -725,6 +725,7 @@ class CheckpointBlock(torch.nn.Module):
             self._on_device = True
         self.profile = ModelProfile()
         self.profile.switch_off_()
+        self._offloaded_hidden = None
         # sort parameters by name
         ordered_parameters = list(self._module.named_parameters())
 
@@ -1175,7 +1176,9 @@ class OpTransformerBlockList(torch.autograd.Function):
             for i in range(len(self)):
                 if offload_list[i]:
                     ctx.offloading_checkpoint = True
-                    offload_hidden_state.append(torch.empty(hidden_state.size(), dtype=hidden_state.dtype, device="cpu", pin_memory=True))
+                    if (self._modules[str(i)]._offloaded_hidden is None) or (self._modules[str(i)]._offloaded_hidden.size() != hidden_state.size()):
+                        self._modules[str(i)]._offloaded_hidden = torch.empty(hidden_state.size(), dtype=hidden_state.dtype, device="cpu", pin_memory=True)
+                    offload_hidden_state.append(self._modules[str(i)]._offloaded_hidden)
                 else:
                     offload_hidden_state.append(None)
                 if self[i].offload_parameter:

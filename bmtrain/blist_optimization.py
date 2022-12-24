@@ -119,7 +119,7 @@ def greedy_scheduling(n, profile_runtime, profile_memory, memory_limit):
             layer_optim = best_optim,
         ).simulate_train().max_runtime
         best_n_layer_optim = 0
-        for n_layer_optim in range(1, n):
+        for n_layer_optim in range(1, n + 1):
             for layer_optim in _block_optim_list:
                 optim = []
                 gap = n // n_layer_optim
@@ -423,6 +423,7 @@ class TBLAutoOptimization:
                 self.tbl._modules[i].profile.switch_off_()
         self.optimize_scheduled = False
         self.train_steps = -1
+        self.max_profile_step = 50
 
     def refresh_convergent(self, refresh_profile = True):
         for i in self.tbl._modules.keys():
@@ -430,7 +431,7 @@ class TBLAutoOptimization:
         if not refresh_profile:
             return
         for i in self.tbl._modules.keys():
-            if not self.convergent[i] and self.train_steps <= 100:
+            if not self.convergent[i] and self.train_steps <= self.max_profile_step:
                 self.profiling[i] = True
                 self.tbl._modules[i].profile.switch_on_()
             else:
@@ -470,9 +471,9 @@ class TBLAutoOptimization:
         if self.optimize_scheduled:
             return
         self.refresh_convergent(refresh_profile = True)
-        if self.train_steps > 100:
+        if self.train_steps > self.max_profile_step:
             if config["local_rank"] == 0:
-                warnings.warn("TBLAutoOptimization has already collected model profiles for over 100 steps, but some of them are still non-convergent. TBLAutoOptimization can still works, but the optimization schedule may be imprecise. This warning is maybe caused by the unstableness of your software resources (e.g., there may be other processes that sharing the same GPU or CPU).")
+                warnings.warn(f"TBLAutoOptimization has already collected model profiles for over {self.max_profile_step} steps, but some of them are still non-convergent. TBLAutoOptimization can still works, but the optimization schedule may be imprecise. This warning is maybe caused by the unstableness of your software resources (e.g., there may be other processes that sharing the same GPU or CPU).")
         else:
             for i in self.tbl._modules.keys():
                 if not self.convergent[i]:
@@ -688,7 +689,7 @@ class ModelSimulator:
             return self.allocate_memory(-mem)
         if isinstance(stream, str):
             stream = config[stream]
-        self.memory_queue.append((self.runtime[stream] + (1e-7), -mem))
+        self.memory_queue.append((self.runtime[stream], -mem))
 
     def wait(self, a, b):
         if isinstance(a, str) and "stream" in a:
@@ -838,11 +839,11 @@ class ModelSimulator:
             self.clear()
         self.forwarding = True
         self.backwarding = False
-        self.stream_synchronize()
         if i is None:
             i = range(self.n)
         if isinstance(i, Iterable):
             _i = i
+            self.stream_synchronize()
             self.simulate_forward(i = _i[0], clear = False, head = True)
             for i in _i:
                 self.simulate_forward(i, clear = False)
@@ -884,11 +885,11 @@ class ModelSimulator:
             self.clear()
         self.forwarding = False
         self.backwarding = True
-        self.stream_synchronize()
         if i is None:
             i = range(self.n)
         if isinstance(i, Iterable):
             _i = i
+            self.stream_synchronize()
             self.simulate_backward(i = _i[-1], clear = False, head = True)
             for i in reversed(_i):
                 self.simulate_backward(i, clear = False)
@@ -907,6 +908,7 @@ class ModelSimulator:
             return self
         if self.optim[i]["segment_synchronization"]:
             self.stream_synchronize()
+
         self.wait("prefetch_stream", "calc_stream")
 
         if config["nvlink_available"]:

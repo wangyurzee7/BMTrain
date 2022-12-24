@@ -15,7 +15,7 @@ from .store import save, load
 
 # debug
 from .block_layer import ModelProfile
-from .blist_optimization import ModelSimulator, get_scheduling_algorithm
+from .blist_optimization import ModelSimulator, get_scheduling_algorithm, _tensor2optim
 from .block_optimization import BlockOptimization, max_block_optim, validate_boptim
 
 from . import benchmark
